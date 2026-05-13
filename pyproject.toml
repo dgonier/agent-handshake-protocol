@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ahp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Agentic Handshake Protocol — addressable, format-aware messaging between heterogeneous agents."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,7 +13,14 @@ authors = [{ name = "AHP Contributors" }]
 dependencies = []
 
 [project.optional-dependencies]
-test = ["pytest>=7", "hypothesis>=6"]
+redis = ["redis>=5.0"]
+test = [
+    "pytest>=7",
+    "pytest-asyncio>=0.23",
+    "hypothesis>=6",
+    "fakeredis>=2.20",
+    "redis>=5.0",
+]
 
 [tool.setuptools.packages.find]
 include = ["ahp*"]
@@ -22,3 +29,5 @@ exclude = ["tests*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

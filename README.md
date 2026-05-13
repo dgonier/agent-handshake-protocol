@@ -5,16 +5,16 @@ agents. Agents are identified by structured URIs, exchange messages
 tagged with hierarchical interaction codes, and negotiate payload format
 through a single shared compatibility matrix.
 
-This repository currently implements **Phase 1 — core primitives**
-(`ahp.core`). Transport, registry, engine, and adapters land in later
-phases.
+This repository implements **Phases 1 + 2**: core primitives plus the
+Redis-backed transport, cache, and registry. The engine and framework
+adapters land in later phases.
 
 ## Status
 
 | Phase | Module | State |
 |-------|--------|-------|
 | 1 | `ahp.core` (addresses, patterns, codes, messages, compatibility) | implemented |
-| 2 | `ahp.transport`, `ahp.registry` | not started |
+| 2 | `ahp.transport` (RedisBus, ProtocolCache), `ahp.registry` | implemented |
 | 3 | `ahp.engine` | not started |
 | 4 | `ahp.adapters` (LangGraph, DSPy, deep agent, human) | not started |
 | 5 | `ahp.demo` | not started |
@@ -22,11 +22,14 @@ phases.
 ## Install
 
 ```bash
-pip install -e ".[test]"
+pip install -e ".[test]"          # for development
+pip install -e ".[redis]"         # core + transport/registry
 ```
 
-`ahp.core` has zero runtime dependencies — only the test extras pull in
-`pytest` and `hypothesis`.
+`ahp.core` has zero runtime dependencies. Importing `ahp.transport` or
+`ahp.registry` requires `redis>=5.0` (install via the `redis` extra).
+The `test` extras also pull in `pytest`, `pytest-asyncio`, `fakeredis`,
+and `hypothesis`.
 
 ## Address Format
 
@@ -119,30 +122,120 @@ m.can_route(src, AgentAddress.parse("o.r.d.sd.j.session.i"), Code.INTERVIEW_SCHE
 A target satisfies a code if its `accept` set intersects the code's
 required tier set (any-of semantics).
 
+## Transport — `RedisBus`
+
+`RedisBus` carries messages over Redis pub/sub (delivery) and Redis
+streams (durable thread history). It does not resolve address patterns —
+callers pass pre-resolved target lists, and the engine handles registry
+lookups in Phase 3.
+
+```python
+from ahp.transport import RedisBus
+import redis.asyncio as aioredis
+
+client = aioredis.from_url("redis://localhost", decode_responses=True)
+bus = RedisBus(client)
+
+# point-to-point with reply collection
+reply = await bus.send_get(request_msg, timeout=5.0)
+
+# broadcast fan-out with bounded collection
+replies = await bus.cast_get(
+    request_msg, targets=[bob, carol], timeout=5.0, max_responses=2,
+)
+
+# durable thread history
+history = await bus.get_thread("thread::tesla-12m")
+```
+
+Verb semantics: `SEND` / `SEND-GET` require an `AgentAddress` target;
+`CAST*` accept patterns at the envelope layer but the bus's `cast()` /
+`cast_get()` take a pre-resolved target list. Bodies must be
+JSON-serializable (strings, dicts, lists, numbers); base64-encode bytes
+upstream.
+
+## Cache — `ProtocolCache`
+
+Read-through cache keyed by SHA-256 of `(target_uri, code)`. TTL is
+derived from the target's lifecycle field: `longterm`=24h, `session`=1h,
+`stale-ok`=7d, `ephemeral` skips caching entirely. `invalidate()`
+supports pattern + param filters by scanning the namespace.
+
+```python
+from ahp.transport import ProtocolCache
+
+cache = ProtocolCache(client)
+hit = await cache.get(request)
+if hit is None:
+    response = await bus.send_get(request, timeout=5.0)
+    await cache.put(request, response)
+
+# bust everything for a specific stock
+await cache.invalidate(
+    AddressPattern.parse("*.adversarial.finance.*.*.*.*"),
+    params={"stock": "Tesla"},
+)
+```
+
+## Registry — `AgentRegistry`
+
+Redis-backed agent directory with TTL liveness markers. `register()`
+stores `AgentMeta` and marks the agent live for `heartbeat_ttl` seconds
+(default 30); subsequent `heartbeat()` calls refresh the marker.
+`resolve()` returns alive agents matching a pattern.
+
+```python
+from ahp.registry import AgentRegistry, AgentMeta
+
+registry = AgentRegistry(client, heartbeat_ttl=30)
+await registry.register(
+    AgentAddress.parse("demo.adversarial.finance.equities.s.session.frank"),
+    AgentMeta(capabilities=["debate", "valuation"], reputation=0.9),
+)
+
+# pattern resolution (alive_only=True by default)
+candidates = await registry.resolve(
+    AddressPattern.parse("*.adversarial.finance.*.s.*.*"),
+)
+
+# rich discovery with capability + reputation filters
+experts = await registry.discover(
+    role="adversarial", domain="finance",
+    capability="valuation", min_reputation=0.7,
+)
+```
+
 ## Tests
 
 ```bash
 pytest
 ```
 
-101 tests cover address round-trips, pattern semantics, code helpers,
-message envelope validation/serialization, and the compatibility matrix,
-plus Hypothesis property tests for parse/serialize stability.
+142 tests, all passing. Includes async tests over `fakeredis` for the
+bus (point-to-point delivery, send/get reply collection, broadcast
+fan-out, bounded `cast_get`, background consumers, dict body
+round-trips, bytes rejection), the cache (TTL derivation, key
+stability under param reordering, pattern + param invalidation), and
+the registry (pattern resolution, liveness expiry, discovery filters).
 
 ## Layout
 
 ```
 ahp/
-└── core/
-    ├── address.py        AgentAddress
-    ├── pattern.py        AddressPattern
-    ├── codes.py          Code constants + family helpers
-    ├── message.py        Message envelope + verbs + TTL table
-    └── compatibility.py  CompatibilityMatrix
+├── core/
+│   ├── address.py        AgentAddress
+│   ├── pattern.py        AddressPattern
+│   ├── codes.py          Code constants + family helpers
+│   ├── message.py        Message envelope + verbs + TTL table
+│   └── compatibility.py  CompatibilityMatrix
+├── transport/
+│   ├── keys.py           Redis key/channel name conventions
+│   ├── redis_bus.py      RedisBus + Subscription
+│   └── cache.py          ProtocolCache + CachedEntry
+└── registry/
+    └── registry.py       AgentRegistry + AgentMeta
 tests/
-    ├── test_address.py
-    ├── test_pattern.py
-    ├── test_codes.py
-    ├── test_message.py
-    └── test_compatibility.py
+    test_address.py  test_pattern.py  test_codes.py  test_message.py
+    test_compatibility.py  test_keys.py
+    test_redis_bus.py  test_cache.py  test_registry.py
 ```
