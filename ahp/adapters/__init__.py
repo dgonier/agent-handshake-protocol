@@ -27,6 +27,9 @@ from ahp.adapters.capability import (
 )
 from ahp.adapters.factory import AgentFactory, Builder, SpawnResult
 from ahp.adapters.human import HumanAgent, ObservationLevel
+# ReactAgent + framework adapters live in their own submodules so the
+# optional deps (langgraph, langchain) stay opt-in. Importable on demand:
+#   from ahp.adapters.react_agent import ReactAgent
 from ahp.adapters.provisioning import (
     FieldNamer,
     ProvisioningField,

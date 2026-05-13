@@ -364,6 +364,42 @@ Composition rules: lists concatenate (priority-first, registration
 order on ties), `prompt` joins with blank lines, `agent_kind` follows
 the highest-priority specifier (default `"react"`).
 
+## LLM-backed agents — `ReactAgent` + Bedrock
+
+`ReactAgent` (in `ahp.adapters.react_agent`) wraps
+`langgraph.prebuilt.create_react_agent` so an `AgentProfile` + a
+LangChain chat model produces a fully-wired AHP agent. Profile tools
+are translated to LangChain `StructuredTool`s; `profile.prompt` becomes
+the system prompt; inbox messages enter the graph as a `HumanMessage`
+and the last `AIMessage` is sent back as the reply.
+
+```python
+from ahp.adapters.capability import AgentProfile, Tool
+from ahp.adapters.react_agent import ReactAgent
+from ahp.llm import bedrock_chat_model
+
+model = bedrock_chat_model()  # reads BEDROCK_MODEL_ID + AWS_REGION from env
+profile = AgentProfile(address=addr, prompt="You are the bear case.")
+agent = ReactAgent.from_profile(addr, engine, profile, model=model)
+await agent.register(); await agent.start()
+```
+
+`ahp.llm.bedrock` builds `ChatBedrockConverse` (cached per model id +
+region) and exposes `has_aws_credentials()` for graceful skipping in
+tests. Credentials themselves come from the standard boto3 chain (the
+AWS CLI, env vars, IAM role) — this package never touches keys.
+
+Copy `.env.example` to `.env` to override the region or model id:
+
+```env
+AWS_REGION=us-east-1
+BEDROCK_MODEL_ID=anthropic.claude-3-5-sonnet-20241022-v2:0
+# AWS_PROFILE=default
+```
+
+Install extras: `pip install -e ".[aws]"` (pulls `langchain-aws`,
+`boto3`, `python-dotenv`).
+
 ## Demo — `ahp.demo.finance_analysis`
 
 End-to-end working pipeline against `fakeredis` (no real Redis or LLM
@@ -411,13 +447,30 @@ Bear view:
 The demo is also runnable as a library function (`from ahp.demo.finance_analysis
 import run`) and is exercised by `tests/test_demo.py`.
 
+### LLM-backed variant — `ahp.demo.finance_react`
+
+Same pipeline, but Bull and Bear are `ReactAgent` instances driven by
+Bedrock chat models. Requires AWS credentials reachable through the
+boto3 chain. Run with:
+
+```bash
+python -m ahp.demo.finance_react
+```
+
+For tests, pass `model=` to `run()` with a fake chat model that
+implements `bind_tools`; `tests/test_demo_react.py` does exactly this
+so the LLM demo's wiring is exercised in CI without hitting AWS. The
+live Bedrock path is gated behind `AHP_RUN_BEDROCK=1` so it stays
+opt-in.
+
 ## Tests
 
 ```bash
 pytest
 ```
 
-266 tests, all passing. Phase 4 coverage includes:
+273 tests passing + 1 cleanly skipped (live Bedrock smoke). Phase 4 / 5
+/ 6 coverage includes:
 
 * `test_agent_base.py` — register/deregister/start/stop, auto-reply,
   handler exception → `error.internal` wrapping, send/broadcast helpers.
@@ -435,6 +488,12 @@ pytest
 * `test_demo.py` — full Phase-5 pipeline: deep researcher composes
   data + bull + bear into a single brief, second query hits cache,
   unknown ticker degrades gracefully, registry holds all five URIs.
+* `test_react_agent.py` — `ReactAgent.from_profile` round-trips through
+  a fake chat model (no AWS), profile tools accepted by LangChain,
+  `extra_tools` injection, list-shaped content coercion.
+* `test_demo_react.py` — LLM demo wired against a fake chat model
+  (cold + cache hit), `run()` without AWS credentials raises a clear
+  error, opt-in live-Bedrock smoke test.
 
 ## Layout
 
@@ -464,9 +523,13 @@ ahp/
 │   ├── human.py            HumanAgent
 │   ├── langgraph_agent.py  LangGraphAgent + DeepAgentDAG  (needs langgraph)
 │   └── dspy_agent.py       DSPyAgent  (needs dspy-ai)
+├── adapters/
+│   └── react_agent.py    ReactAgent (wraps create_react_agent)
+├── llm/
+│   └── bedrock.py        ChatBedrockConverse helper + has_aws_credentials()
 └── demo/
-    └── finance_analysis.py end-to-end pipeline: human → researcher (deep) →
-                            data + bull + bear, with cache hit on repeat
+    ├── finance_analysis.py end-to-end pipeline (deterministic stubs)
+    └── finance_react.py    same pipeline, Bedrock-driven Bull + Bear
 tests/
     test_address.py  test_pattern.py  test_codes.py  test_message.py
     test_compatibility.py  test_keys.py
