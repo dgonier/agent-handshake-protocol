@@ -5,10 +5,11 @@ agents. Agents are identified by structured URIs, exchange messages
 tagged with hierarchical interaction codes, and negotiate payload format
 through a single shared compatibility matrix.
 
-This repository implements **Phases 1–4**: core primitives, Redis
-transport, cache, registry, the protocol engine + thread manager, and
-the framework adapter layer (LangGraph, DSPy, deep agent, human) with
-an agent factory, provisioning patterns, and a capability registry.
+All five phases of the plan are implemented: core primitives, Redis
+transport, cache, registry, the protocol engine + thread manager, the
+framework adapter layer (LangGraph, DSPy, deep agent, human) with
+factory, provisioning patterns, and a capability registry, plus a
+runnable end-to-end demo.
 
 ## Status
 
@@ -18,7 +19,7 @@ an agent factory, provisioning patterns, and a capability registry.
 | 2 | `ahp.transport` (RedisBus, ProtocolCache), `ahp.registry` | implemented |
 | 3 | `ahp.engine` (ProtocolEngine, ThreadManager) | implemented |
 | 4 | `ahp.adapters` (AHPAgent, LangGraph, DSPy, deep agent, human, factory, provisioning, capabilities) | implemented |
-| 5 | `ahp.demo` | not started |
+| 5 | `ahp.demo.finance_analysis` (runnable end-to-end demo) | implemented |
 
 ## Install
 
@@ -363,13 +364,60 @@ Composition rules: lists concatenate (priority-first, registration
 order on ties), `prompt` joins with blank lines, `agent_kind` follows
 the highest-priority specifier (default `"react"`).
 
+## Demo — `ahp.demo.finance_analysis`
+
+End-to-end working pipeline against `fakeredis` (no real Redis or LLM
+needed):
+
+```bash
+python -m ahp.demo.finance_analysis
+```
+
+What it does:
+
+1. Builds bus + registry + cache + engine.
+2. Wires a `CapabilityRegistry` (per-role prompts) into an `AgentFactory`.
+3. Constructs five agents via the factory:
+   * **Bull** — `LangGraphAgent` over a tiny `StateGraph`.
+   * **Bear** — `DSPyAgent` over a stubbed `dspy.Module`.
+   * **Data** — plain `AHPAgent` returning canned fundamentals.
+   * **Researcher** — `DeepAgentDAG` whose node calls back into the
+     engine, doing a `SEND-GET` to data and a `CAST-GET` to the
+     adversarial pattern.
+   * **Human** — `HumanAgent` at observation level L2.
+4. Drives a `HUMAN_QUERY` `SEND-GET` from the human to the researcher.
+   The deep agent fans out concurrently and composes a single brief.
+5. Sends the same query a second time → response cache short-circuits;
+   typical speedup ~700×.
+
+Sample output:
+
+```
+=== Devin asks the researcher (cold) ===
+=== Analysis for Tesla ===
+
+Fundamentals:
+  Revenue $96B, EPS $4.30, P/E 70, EV/EBITDA 45, FCF $7.5B. ...
+
+Bull view:
+  Bull case for Tesla: durable competitive moat, expanding TAM, ...
+
+Bear view:
+  Bear case for Tesla: regulatory headwinds, margin compression, ...
+
+--- timing: cold=120.6ms, warm=0.2ms (speedup ~735x) ---
+```
+
+The demo is also runnable as a library function (`from ahp.demo.finance_analysis
+import run`) and is exercised by `tests/test_demo.py`.
+
 ## Tests
 
 ```bash
 pytest
 ```
 
-261 tests, all passing. Phase 4 coverage includes:
+266 tests, all passing. Phase 4 coverage includes:
 
 * `test_agent_base.py` — register/deregister/start/stop, auto-reply,
   handler exception → `error.internal` wrapping, send/broadcast helpers.
@@ -384,6 +432,9 @@ pytest
 * `test_langgraph_agent.py` — graph round-trips, custom mappers,
   `DeepAgentDAG` recursion through the engine.
 * `test_dspy_agent.py` — module round-trips, custom field names.
+* `test_demo.py` — full Phase-5 pipeline: deep researcher composes
+  data + bull + bear into a single brief, second query hits cache,
+  unknown ticker degrades gracefully, registry holds all five URIs.
 
 ## Layout
 
@@ -405,14 +456,17 @@ ahp/
 │   ├── router.py         ProtocolEngine (verb dispatcher)
 │   ├── thread_manager.py ThreadManager + Thread
 │   └── errors.py         ProtocolError / IncompatibleTargetError / ...
-└── adapters/
-    ├── base.py             AHPAgent
-    ├── factory.py          AgentFactory + SpawnResult
-    ├── provisioning.py     ProvisioningPattern + N* / *N / dash variants
-    ├── capability.py       Tool / Skill / RagSource / AgentProfile / CapabilityRegistry
-    ├── human.py            HumanAgent
-    ├── langgraph_agent.py  LangGraphAgent + DeepAgentDAG  (needs langgraph)
-    └── dspy_agent.py       DSPyAgent  (needs dspy-ai)
+├── adapters/
+│   ├── base.py             AHPAgent
+│   ├── factory.py          AgentFactory + SpawnResult
+│   ├── provisioning.py     ProvisioningPattern + N* / *N / dash variants
+│   ├── capability.py       Tool / Skill / RagSource / AgentProfile / CapabilityRegistry
+│   ├── human.py            HumanAgent
+│   ├── langgraph_agent.py  LangGraphAgent + DeepAgentDAG  (needs langgraph)
+│   └── dspy_agent.py       DSPyAgent  (needs dspy-ai)
+└── demo/
+    └── finance_analysis.py end-to-end pipeline: human → researcher (deep) →
+                            data + bull + bear, with cache hit on repeat
 tests/
     test_address.py  test_pattern.py  test_codes.py  test_message.py
     test_compatibility.py  test_keys.py
@@ -421,4 +475,5 @@ tests/
     test_agent_base.py  test_factory.py  test_provisioning.py
     test_capability.py  test_human_agent.py
     test_langgraph_agent.py  test_dspy_agent.py
+    test_demo.py
 ```
