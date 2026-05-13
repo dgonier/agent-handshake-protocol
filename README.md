@@ -5,9 +5,9 @@ agents. Agents are identified by structured URIs, exchange messages
 tagged with hierarchical interaction codes, and negotiate payload format
 through a single shared compatibility matrix.
 
-This repository implements **Phases 1 + 2**: core primitives plus the
-Redis-backed transport, cache, and registry. The engine and framework
-adapters land in later phases.
+This repository implements **Phases 1–3**: core primitives, Redis
+transport, cache, registry, and the protocol engine + thread manager.
+Framework adapters and the integration demo come next.
 
 ## Status
 
@@ -15,7 +15,7 @@ adapters land in later phases.
 |-------|--------|-------|
 | 1 | `ahp.core` (addresses, patterns, codes, messages, compatibility) | implemented |
 | 2 | `ahp.transport` (RedisBus, ProtocolCache), `ahp.registry` | implemented |
-| 3 | `ahp.engine` | not started |
+| 3 | `ahp.engine` (ProtocolEngine, ThreadManager) | implemented |
 | 4 | `ahp.adapters` (LangGraph, DSPy, deep agent, human) | not started |
 | 5 | `ahp.demo` | not started |
 
@@ -205,18 +205,70 @@ experts = await registry.discover(
 )
 ```
 
+## Engine — `ProtocolEngine`
+
+The engine is the outbound gate: agents construct a `Message` and hand
+it to `engine.handle()`, which validates the envelope, checks the
+cache for `SEND-GET`, resolves patterns via the registry, filters by
+the compatibility matrix, dispatches via the bus, and caches the
+response on the way out.
+
+```python
+from ahp.engine import ProtocolEngine
+
+engine = ProtocolEngine(bus, registry, cache, matrix=None, threads=None)
+
+# point-to-point
+delivered = await engine.handle(send_msg)             # int
+reply     = await engine.handle(send_get_msg)         # Message | None
+
+# broadcast
+delivered = await engine.handle(cast_msg)             # int
+replies   = await engine.handle(
+    cast_get_msg, timeout=5.0, max_responses=3,
+)                                                     # list[Message]
+
+# cache busting
+n = await engine.handle(invalidate_msg)               # int
+```
+
+Return shapes by verb: `SEND` → delivery count; `SEND-GET` → response
+or `None` (cache hits short-circuit the bus); `CAST` → fan-out count;
+`CAST-GET` → list of responses; `INVALIDATE` → entries cleared.
+`CAST-SUB` is reserved for Phase 4.
+
+Errors raised: `IncompatibleTargetError` when the target's accept set
+doesn't satisfy the code's tier requirements; `InvalidTargetTypeError`
+when a verb's target shape is wrong (pattern where address is
+required, or vice versa).
+
+## Thread manager — `ThreadManager`
+
+Thread metadata (topic, initiator, status), participation set, and
+tier-filtered history reads layered on top of the bus's stream:
+
+```python
+tid = await engine.spawn_thread("Tesla outlook", initiator=alice)
+await engine.join_thread(tid, bob)
+
+# Human observer view: drop anything the code can't render as a string.
+history = await engine.threads.get_history(tid, tier_filter="s")
+
+# Slice the stream by Redis stream IDs.
+recent = await engine.threads.get_history(tid, min_id="-", max_id="+", count=20)
+```
+
 ## Tests
 
 ```bash
 pytest
 ```
 
-142 tests, all passing. Includes async tests over `fakeredis` for the
-bus (point-to-point delivery, send/get reply collection, broadcast
-fan-out, bounded `cast_get`, background consumers, dict body
-round-trips, bytes rejection), the cache (TTL derivation, key
-stability under param reordering, pattern + param invalidation), and
-the registry (pattern resolution, liveness expiry, discovery filters).
+178 tests, all passing. Includes async coverage over `fakeredis` for
+the bus, cache, registry, engine (per-verb dispatch, compatibility
+gating, liveness filtering, `SEND-GET` caching round-trips,
+`INVALIDATE` with params), and thread manager (lifecycle,
+participants, tier-filtered history).
 
 ## Layout
 
@@ -232,10 +284,15 @@ ahp/
 │   ├── keys.py           Redis key/channel name conventions
 │   ├── redis_bus.py      RedisBus + Subscription
 │   └── cache.py          ProtocolCache + CachedEntry
-└── registry/
-    └── registry.py       AgentRegistry + AgentMeta
+├── registry/
+│   └── registry.py       AgentRegistry + AgentMeta
+└── engine/
+    ├── router.py         ProtocolEngine (verb dispatcher)
+    ├── thread_manager.py ThreadManager + Thread
+    └── errors.py         ProtocolError / IncompatibleTargetError / ...
 tests/
     test_address.py  test_pattern.py  test_codes.py  test_message.py
     test_compatibility.py  test_keys.py
     test_redis_bus.py  test_cache.py  test_registry.py
+    test_engine.py  test_thread_manager.py
 ```

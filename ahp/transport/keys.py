@@ -32,6 +32,16 @@ class Keys:
         """Append-only stream of all messages on a given thread."""
         return f"{PREFIX}:thread:{thread_id}"
 
+    @staticmethod
+    def thread_meta(thread_id: str) -> str:
+        """Hash storing a thread's topic/initiator/timestamps/status."""
+        return f"{PREFIX}:thread-meta:{thread_id}"
+
+    @staticmethod
+    def thread_participants(thread_id: str) -> str:
+        """Set of canonical agent URIs participating in a thread."""
+        return f"{PREFIX}:thread-parts:{thread_id}"
+
     # ── registry ─────────────────────────────────────────────────────
     @staticmethod
     def registry_hash() -> str:
