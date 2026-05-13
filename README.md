@@ -5,9 +5,10 @@ agents. Agents are identified by structured URIs, exchange messages
 tagged with hierarchical interaction codes, and negotiate payload format
 through a single shared compatibility matrix.
 
-This repository implements **Phases 1–3**: core primitives, Redis
-transport, cache, registry, and the protocol engine + thread manager.
-Framework adapters and the integration demo come next.
+This repository implements **Phases 1–4**: core primitives, Redis
+transport, cache, registry, the protocol engine + thread manager, and
+the framework adapter layer (LangGraph, DSPy, deep agent, human) with
+an agent factory, provisioning patterns, and a capability registry.
 
 ## Status
 
@@ -16,7 +17,7 @@ Framework adapters and the integration demo come next.
 | 1 | `ahp.core` (addresses, patterns, codes, messages, compatibility) | implemented |
 | 2 | `ahp.transport` (RedisBus, ProtocolCache), `ahp.registry` | implemented |
 | 3 | `ahp.engine` (ProtocolEngine, ThreadManager) | implemented |
-| 4 | `ahp.adapters` (LangGraph, DSPy, deep agent, human) | not started |
+| 4 | `ahp.adapters` (AHPAgent, LangGraph, DSPy, deep agent, human, factory, provisioning, capabilities) | implemented |
 | 5 | `ahp.demo` | not started |
 
 ## Install
@@ -258,17 +259,131 @@ history = await engine.threads.get_history(tid, tier_filter="s")
 recent = await engine.threads.get_history(tid, min_id="-", max_id="+", count=20)
 ```
 
+## Adapters — `ahp.adapters`
+
+`AHPAgent` is the abstract base every framework adapter inherits from.
+Subclasses override `handle_message()`; the base handles registration,
+inbox consumption, heartbeats, auto-reply, and error wrapping.
+
+Available adapters:
+
+| Adapter | Wraps | Optional dep |
+|---------|-------|--------------|
+| `HumanAgent` | callbacks (`on_message`, `input_provider`) with L0–L3 observation levels | — |
+| `LangGraphAgent` | a compiled `StateGraph` | `langgraph` |
+| `DeepAgentDAG` | a graph whose nodes recurse via `config["configurable"]["ahp_engine"]` | `langgraph` |
+| `DSPyAgent` | a `dspy.Module` (run in a worker thread) | `dspy-ai` |
+
+```python
+from langgraph.graph import END, START, StateGraph
+from ahp.adapters.langgraph_agent import LangGraphAgent
+
+# build a graph; here a trivial uppercase node
+g = StateGraph(dict)
+g.add_node("up", lambda s: {"output": s["input"].upper()})
+g.add_edge(START, "up"); g.add_edge("up", END)
+agent = LangGraphAgent(addr, engine, g.compile())
+await agent.register(); await agent.start()
+```
+
+## Provisioning patterns — `ProvisioningPattern`
+
+Bulk-spawn spec with per-field counts. The two count syntaxes have
+distinct semantics — *prefix* is "ceiling-with-cycling", *suffix* is
+Cartesian:
+
+| Syntax | Meaning |
+|--------|---------|
+| `N*` | up to N for this field, cycle modulo N. Multiple prefix-N fields share one outer loop → total = `max(N_i)`. |
+| `*N` | Cartesian multiplier. Stacks with prefix-N: total = `max × prod(suffix)`. |
+| `N-*` | same as `N*` but **fresh-only** — ignore the registry, always spawn N new. |
+| `*-N` | same as `*N` but fresh-only. |
+| no dash | reuse-then-top-up — pull existing alive agents matching the spec's fixed skeleton, top up with fresh names. |
+
+```text
+4*.adversarial.finance.2*.s.session.*     → 4 agents (subdomain cycles)
+*4.adversarial.finance.*2.s.session.*     → 8 agents (Cartesian)
+*4.adversarial.finance.2*.s.session.*     → 8 agents (4 orgs × 2 iters)
+4-*.adversarial.finance.2-*.s.session.*   → 4 fresh agents, no reuse
+```
+
+## Factory — `AgentFactory`
+
+Pattern-keyed registry of builders that turn addresses into agents,
+optionally informed by an `AgentProfile` from the
+`CapabilityRegistry`.
+
+```python
+from ahp.adapters import (
+    AgentFactory, CapabilityRegistry, Tool, Skill, RagSource,
+)
+
+caps = CapabilityRegistry()
+caps.register("*.*.finance.*.*.*.*",
+              tools=[Tool("get_quote", "fetch stock quote", get_quote_fn)])
+caps.register("*.adversarial.*.*.*.*.*",
+              prompt="Argue the bear case.", agent_kind="react", priority=5)
+
+factory = AgentFactory(engine, capabilities=caps)
+factory.register(
+    "*.adversarial.*.*.*.*.*",
+    lambda address, engine, profile: MyReactAgent(
+        address, engine,
+        tools=profile.all_tools, prompt=profile.prompt,
+    ),
+)
+
+# spawn 4 fresh adversarial finance analysts, cycling 2 subdomains
+result = await factory.spawn_and_start(
+    "4-*.adversarial.finance.2-*.s.session.*",
+)
+print(len(result.new), len(result.reused))   # → 4, 0
+```
+
+## Capabilities — `CapabilityRegistry`
+
+Address fields drive agent configuration: `domain`/`subdomain` selects
+tools/skills/RAG, `role` partially determines agent kind. Capability
+providers are pattern-keyed fragments; the registry merges every
+matching fragment for an address into a single `AgentProfile` that the
+factory passes to builders.
+
+```python
+@dataclass
+class AgentProfile:
+    address: AgentAddress
+    tools: tuple[Tool, ...]
+    skills: tuple[Skill, ...]
+    rag_sources: tuple[RagSource, ...]
+    prompt: str
+    agent_kind: Literal["react", "deep", "custom"]
+```
+
+Composition rules: lists concatenate (priority-first, registration
+order on ties), `prompt` joins with blank lines, `agent_kind` follows
+the highest-priority specifier (default `"react"`).
+
 ## Tests
 
 ```bash
 pytest
 ```
 
-178 tests, all passing. Includes async coverage over `fakeredis` for
-the bus, cache, registry, engine (per-verb dispatch, compatibility
-gating, liveness filtering, `SEND-GET` caching round-trips,
-`INVALIDATE` with params), and thread manager (lifecycle,
-participants, tier-filtered history).
+261 tests, all passing. Phase 4 coverage includes:
+
+* `test_agent_base.py` — register/deregister/start/stop, auto-reply,
+  handler exception → `error.internal` wrapping, send/broadcast helpers.
+* `test_provisioning.py` — prefix vs suffix semantics, dash variants,
+  field constraints, custom namers, user's company×subdomain example.
+* `test_factory.py` — pattern + priority dispatch, reuse-then-top-up,
+  dash skips registry, dead agents not reused.
+* `test_capability.py` — fragment merging, priority ordering, prompt
+  composition, profile passed through factory + spawn.
+* `test_human_agent.py` — L0–L3 observation levels, truncation,
+  input-provider reply flow.
+* `test_langgraph_agent.py` — graph round-trips, custom mappers,
+  `DeepAgentDAG` recursion through the engine.
+* `test_dspy_agent.py` — module round-trips, custom field names.
 
 ## Layout
 
@@ -286,13 +401,24 @@ ahp/
 │   └── cache.py          ProtocolCache + CachedEntry
 ├── registry/
 │   └── registry.py       AgentRegistry + AgentMeta
-└── engine/
-    ├── router.py         ProtocolEngine (verb dispatcher)
-    ├── thread_manager.py ThreadManager + Thread
-    └── errors.py         ProtocolError / IncompatibleTargetError / ...
+├── engine/
+│   ├── router.py         ProtocolEngine (verb dispatcher)
+│   ├── thread_manager.py ThreadManager + Thread
+│   └── errors.py         ProtocolError / IncompatibleTargetError / ...
+└── adapters/
+    ├── base.py             AHPAgent
+    ├── factory.py          AgentFactory + SpawnResult
+    ├── provisioning.py     ProvisioningPattern + N* / *N / dash variants
+    ├── capability.py       Tool / Skill / RagSource / AgentProfile / CapabilityRegistry
+    ├── human.py            HumanAgent
+    ├── langgraph_agent.py  LangGraphAgent + DeepAgentDAG  (needs langgraph)
+    └── dspy_agent.py       DSPyAgent  (needs dspy-ai)
 tests/
     test_address.py  test_pattern.py  test_codes.py  test_message.py
     test_compatibility.py  test_keys.py
     test_redis_bus.py  test_cache.py  test_registry.py
     test_engine.py  test_thread_manager.py
+    test_agent_base.py  test_factory.py  test_provisioning.py
+    test_capability.py  test_human_agent.py
+    test_langgraph_agent.py  test_dspy_agent.py
 ```
