@@ -33,11 +33,24 @@ from ahp.registry.registry import AgentMeta
 
 
 def _to_langchain_tool(tool: Tool) -> StructuredTool:
-    """Convert an AHP :class:`Tool` to a LangChain ``StructuredTool``."""
+    """Convert an AHP :class:`Tool` to a LangChain ``StructuredTool``.
+
+    Detects coroutine handlers and wires them as the tool's async path so
+    LangChain doesn't try to ``asyncio.run`` them inside an already-running
+    event loop.
+    """
+    import asyncio
+
+    if asyncio.iscoroutinefunction(tool.handler):
+        return StructuredTool.from_function(
+            coroutine=tool.handler,
+            name=tool.name,
+            description=tool.description,
+        )
     return StructuredTool.from_function(
+        func=tool.handler,
         name=tool.name,
         description=tool.description,
-        func=tool.handler,
     )
 
 

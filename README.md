@@ -388,7 +388,7 @@ Composition rules: lists concatenate (priority-first, registration
 order on ties), `prompt` joins with blank lines, `agent_kind` follows
 the highest-priority specifier (default `"react"`).
 
-## LLM-backed agents — `ReactAgent` + Bedrock
+## LLM-backed agents — `ReactAgent`, `DeepAgent`, Bedrock
 
 `ReactAgent` (in `ahp.adapters.react_agent`) wraps
 `langgraph.prebuilt.create_react_agent` so an `AgentProfile` + a
@@ -423,6 +423,37 @@ BEDROCK_MODEL_ID=anthropic.claude-3-5-sonnet-20241022-v2:0
 
 Install extras: `pip install -e ".[aws]"` (pulls `langchain-aws`,
 `boto3`, `python-dotenv`).
+
+### Deep agents — `DeepAgent`
+
+`DeepAgent` (in `ahp.adapters.deep_agent`) wraps
+`deepagents.create_deep_agent`, which adds a planner, subagents, and a
+virtual filesystem on top of the ReAct loop. From an `AgentProfile`:
+
+* `profile.tools` → planner tools
+* `profile.skills` → `SubAgent` entries the planner can delegate to
+  (each `Skill.name`/`description`/`prompt_fragment`/`tools` is mapped
+  to the matching `SubAgent` field)
+* `profile.prompt` → top-level system prompt
+* `extra_tools=` → AHP-aware closures that let the planner reach back
+  into the protocol (see the LLM demo for `lookup_fundamentals` and
+  `hold_debate` examples)
+
+```python
+from ahp.adapters.deep_agent import DeepAgent
+
+researcher = DeepAgent.from_profile(
+    address, engine, profile, model=bedrock_chat_model(),
+    extra_tools=[lookup_fundamentals_tool, hold_debate_tool],
+)
+```
+
+The translator (`_to_langchain_tool`) detects coroutine handlers and
+wires them as the LangChain tool's async path — so AHP-aware tools can
+`await engine.handle(...)` inside an already-running event loop without
+the usual `asyncio.run` re-entrancy crash.
+
+Install extras: `pip install -e ".[deepagents]"`.
 
 ## Demo — `ahp.demo.finance_analysis`
 
@@ -473,9 +504,17 @@ import run`) and is exercised by `tests/test_demo.py`.
 
 ### LLM-backed variant — `ahp.demo.finance_react`
 
-Same pipeline, but Bull and Bear are `ReactAgent` instances driven by
-Bedrock chat models. Requires AWS credentials reachable through the
-boto3 chain. Run with:
+Same pipeline as the stub demo, but the agents are LLM-driven:
+
+* **Bull** and **Bear** are `ReactAgent` instances with role-specific
+  prompts layered on top of the capability registry.
+* **Researcher** is a `DeepAgent` (`deepagents.create_deep_agent`) with
+  two AHP-aware tools — `lookup_fundamentals` calls the Data agent over
+  the protocol, `hold_debate` fans the question out to every
+  `*.adversarial.finance.*` agent via `CAST-GET`. The planner decides
+  when to call each one.
+
+Requires AWS credentials reachable through the boto3 chain. Run with:
 
 ```bash
 python -m ahp.demo.finance_react
@@ -548,7 +587,8 @@ ahp/
 │   ├── langgraph_agent.py  LangGraphAgent + DeepAgentDAG  (needs langgraph)
 │   └── dspy_agent.py       DSPyAgent  (needs dspy-ai)
 ├── adapters/
-│   └── react_agent.py    ReactAgent (wraps create_react_agent)
+│   ├── react_agent.py    ReactAgent (wraps create_react_agent)
+│   └── deep_agent.py     DeepAgent (wraps deepagents.create_deep_agent)
 ├── llm/
 │   └── bedrock.py        ChatBedrockConverse helper + has_aws_credentials()
 └── demo/

@@ -1,11 +1,14 @@
-"""LLM-backed variant of the adversarial-finance demo.
+"""LLM-backed adversarial-finance demo.
 
 Mirrors :mod:`ahp.demo.finance_analysis` but swaps the deterministic
-stubs for real ReAct agents driven by AWS Bedrock chat models. Bull
-and Bear are :class:`ReactAgent` instances with role-specific system
-prompts; the Data agent stays deterministic (it's a fixture/RAG
-source); the Researcher remains a :class:`DeepAgentDAG` whose node
-recurses into the engine.
+stubs for real LLM-driven agents:
+
+* **Researcher** is a :class:`DeepAgent` (``deepagents.create_deep_agent``)
+  whose tool set includes AHP-aware closures so the planner can invoke
+  Bull, Bear, and the Data agent over the protocol.
+* **Bull** / **Bear** are :class:`ReactAgent` instances with role-specific
+  system prompts layered on top of the capability registry.
+* **Data** stays deterministic — it's a fixture/RAG source, not a model.
 
 Configuration comes from environment / ``.env``: see ``.env.example``.
 
@@ -13,20 +16,16 @@ Run::
 
     python -m ahp.demo.finance_react
 
-This module deliberately keeps a graceful fallback: if AWS credentials
-aren't available, :func:`run` raises a clear error rather than
-attempting a useless Bedrock call. Tests that depend on a live model
-should gate on :func:`ahp.llm.has_aws_credentials`.
+If AWS credentials aren't reachable, :func:`run` raises a clear error
+rather than attempting a useless Bedrock call. Tests pass a fake chat
+model via ``model=`` to exercise the wiring without real credentials.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from typing import Awaitable, Callable
-
-from langchain_core.runnables import RunnableConfig
-from langgraph.graph import END, START, StateGraph
+from typing import Any, Awaitable, Callable
 
 from ahp.adapters import (
     AgentFactory,
@@ -36,7 +35,7 @@ from ahp.adapters import (
     Tool,
 )
 from ahp.adapters.base import AHPAgent
-from ahp.adapters.langgraph_agent import DeepAgentDAG
+from ahp.adapters.deep_agent import DeepAgent
 from ahp.adapters.react_agent import ReactAgent
 from ahp.core import AgentAddress, AddressPattern, Code, Message
 from ahp.demo.finance_analysis import (
@@ -47,7 +46,6 @@ from ahp.demo.finance_analysis import (
     RESEARCHER_URI,
     DemoResult,
     _DataAgent,
-    _ResearchState,
     _build_capabilities,
 )
 from ahp.engine import ProtocolEngine
@@ -56,69 +54,81 @@ from ahp.registry import AgentMeta, AgentRegistry
 from ahp.transport import ProtocolCache, RedisBus
 
 
-# ── researcher node — same shape as the stub demo's _research_node but
-# uses CAST-GET to the adversarial pattern so any number of real ReAct
-# debaters can participate. ─────────────────────────────────────────────
+# ── AHP-aware tools for the deep researcher ────────────────────────────
+#
+# These factories return AHP :class:`Tool` instances whose handlers
+# close over the engine + the researcher's own address, turning protocol
+# calls into ordinary LLM-callable functions.
 
 
-async def _research_node(state: _ResearchState, config: RunnableConfig) -> dict:
-    engine: ProtocolEngine = config["configurable"]["ahp_engine"]
-    me: AgentAddress = config["configurable"]["ahp_address"]
-    inbound: Message = config["configurable"]["ahp_message"]
-    question = state["question"]
+def _make_lookup_fundamentals_tool(
+    engine: ProtocolEngine,
+    self_address: AgentAddress,
+    thread: str,
+) -> Tool:
+    async def lookup_fundamentals(ticker: str) -> str:
+        """Look up canned fundamentals for a stock ticker (e.g. 'Tesla', 'Apple')."""
+        msg = Message(
+            source=self_address,
+            target=AgentAddress.parse(DATA_URI),
+            verb="SEND-GET",
+            code=Code.INTERVIEW_DATA,
+            thread=thread,
+            body=ticker,
+        )
+        reply = await engine.handle(msg, timeout=20.0)
+        return reply.body if reply else f"(no data for {ticker})"
 
-    data_req = Message(
-        source=me, target=AgentAddress.parse(DATA_URI),
-        verb="SEND-GET", code=Code.INTERVIEW_DATA,
-        thread=inbound.thread, body=question,
+    return Tool(
+        name="lookup_fundamentals",
+        description="Look up canned fundamentals for a stock ticker.",
+        handler=lookup_fundamentals,
     )
-    data_reply = await engine.handle(data_req, timeout=10.0)
-    data_str = data_reply.body if data_reply else "(no data available)"
 
-    debate_req = Message(
-        source=me,
-        target=AddressPattern.parse("*.adversarial.finance.*.s.*.*"),
-        verb="CAST-GET", code=Code.ADVERSARIAL_DEBATE,
-        thread=inbound.thread,
-        body=f"Question: {question}\n\nFundamentals:\n{data_str}",
+
+def _make_debate_tool(
+    engine: ProtocolEngine,
+    self_address: AgentAddress,
+    thread: str,
+) -> Tool:
+    async def hold_debate(question: str) -> str:
+        """Fan a question out to every adversarial finance agent and collect their cases.
+
+        Returns the concatenated bull/bear views, labeled by side."""
+        msg = Message(
+            source=self_address,
+            target=AddressPattern.parse("*.adversarial.finance.*.s.*.*"),
+            verb="CAST-GET",
+            code=Code.ADVERSARIAL_DEBATE,
+            thread=thread,
+            body=question,
+        )
+        replies: list[Message] = await engine.handle(msg, timeout=60.0)
+        if not replies:
+            return "(no debaters responded)"
+        lines = []
+        for r in replies:
+            label = "BULL" if "bull" in r.source.instance else (
+                "BEAR" if "bear" in r.source.instance else r.source.instance
+            )
+            lines.append(f"--- {label} ({r.source.instance}) ---\n{r.body}")
+        return "\n\n".join(lines)
+
+    return Tool(
+        name="hold_debate",
+        description=(
+            "Hold an adversarial debate by fanning the question out to every "
+            "*.adversarial.finance.* agent and collecting their cases."
+        ),
+        handler=hold_debate,
     )
-    debate_replies: list[Message] = await engine.handle(debate_req, timeout=60.0)
-
-    bull_view = ""
-    bear_view = ""
-    for reply in debate_replies:
-        if "bull" in reply.source.instance:
-            bull_view = str(reply.body)
-        elif "bear" in reply.source.instance:
-            bear_view = str(reply.body)
-
-    composed = (
-        f"=== Analysis for {question} ===\n"
-        f"\nFundamentals:\n  {data_str}\n"
-        f"\nBull view:\n  {bull_view or '(no bull response)'}\n"
-        f"\nBear view:\n  {bear_view or '(no bear response)'}\n"
-    )
-    return {
-        "data": data_str, "bull": bull_view, "bear": bear_view,
-        "output": composed,
-    }
 
 
-def _build_researcher_graph():
-    g: StateGraph = StateGraph(_ResearchState)
-    g.add_node("research", _research_node)
-    g.add_edge(START, "research")
-    g.add_edge("research", END)
-    return g.compile()
-
-
-# ── builders that use ReactAgent + Bedrock ─────────────────────────────
+# ── builders ───────────────────────────────────────────────────────────
 
 
 def _bull_builder_with_model(model):
     def build(address: AgentAddress, engine: ProtocolEngine, profile: AgentProfile):
-        # Layer a bull-specific instruction on top of whatever the capability
-        # registry contributed.
         bull_profile = AgentProfile(
             address=profile.address,
             tools=profile.tools,
@@ -173,7 +183,7 @@ def _bear_builder_with_model(model):
     return build
 
 
-def _data_builder(address: AgentAddress, engine: ProtocolEngine, profile: AgentProfile) -> AHPAgent:
+def _data_builder(address, engine, profile):
     return _DataAgent(
         address, engine,
         metadata=AgentMeta(
@@ -185,17 +195,42 @@ def _data_builder(address: AgentAddress, engine: ProtocolEngine, profile: AgentP
     )
 
 
-def _researcher_builder(address: AgentAddress, engine: ProtocolEngine, profile: AgentProfile) -> AHPAgent:
-    return DeepAgentDAG(
-        address, engine, _build_researcher_graph(),
-        input_mapper=lambda m: {"question": m.body},
-        metadata=AgentMeta(
-            capabilities=["synthesis", "multi-agent-orchestration"],
-            description="Deep-research orchestrator (Bedrock-driven debate).",
-            reputation=0.85,
-        ),
-        heartbeat_interval=0,
-    )
+def _researcher_builder_with_model(model, *, thread: str):
+    """Researcher is a deepagents.create_deep_agent with AHP-aware tools."""
+
+    def build(address: AgentAddress, engine: ProtocolEngine, profile: AgentProfile):
+        # Layer a researcher-specific instruction on top of the profile prompt
+        # the capability registry already contributed.
+        researcher_profile = AgentProfile(
+            address=profile.address,
+            tools=profile.tools,
+            skills=profile.skills,
+            rag_sources=profile.rag_sources,
+            prompt=(
+                (profile.prompt + "\n\n" if profile.prompt else "")
+                + "You are an equities research coordinator. For each user "
+                "question: (1) call `lookup_fundamentals` to get the data, "
+                "(2) call `hold_debate` to gather bull and bear views, "
+                "(3) compose a single concise brief that includes the "
+                "fundamentals, bull view, and bear view."
+            ),
+            agent_kind="deep",
+        )
+        return DeepAgent.from_profile(
+            address, engine, researcher_profile, model=model,
+            extra_tools=[
+                _make_lookup_fundamentals_tool(engine, address, thread),
+                _make_debate_tool(engine, address, thread),
+            ],
+            metadata=AgentMeta(
+                capabilities=["synthesis", "multi-agent-orchestration"],
+                description="Deep-research orchestrator (deepagents + Bedrock).",
+                reputation=0.85,
+            ),
+            heartbeat_interval=0,
+        )
+
+    return build
 
 
 # ── run loop ───────────────────────────────────────────────────────────
@@ -207,10 +242,11 @@ async def run(
     model=None,
     on_human_message: Callable[[str], Awaitable[None]] | None = None,
     question: str = "Tesla",
+    thread: str = "thread::devin::main",
 ) -> DemoResult:
     """Drive the LLM-backed demo. Requires usable AWS credentials.
 
-    ``model`` may be passed in for testing (e.g. a fake chat model that
+    ``model`` may be passed in for testing (a fake chat model that
     supports ``bind_tools``). If omitted, a cached Bedrock model is
     constructed from environment configuration.
     """
@@ -231,21 +267,23 @@ async def run(
     bus = RedisBus(redis_client)
     registry = AgentRegistry(redis_client, heartbeat_ttl=120)
     cache = ProtocolCache(redis_client)
-    engine = ProtocolEngine(bus, registry, cache, default_timeout=60.0)
+    engine = ProtocolEngine(bus, registry, cache, default_timeout=120.0)
 
     factory = AgentFactory(engine, capabilities=_build_capabilities())
     factory.register(
         "*.adversarial.finance.*.*.*.bull",
-        _bull_builder_with_model(model),
-        priority=10,
+        _bull_builder_with_model(model), priority=10,
     )
     factory.register(
         "*.adversarial.finance.*.*.*.bear",
-        _bear_builder_with_model(model),
-        priority=10,
+        _bear_builder_with_model(model), priority=10,
     )
     factory.register("*.interview.finance.*.*.*.*", _data_builder, priority=10)
-    factory.register("*.collaborative.finance.*.*.*.*", _researcher_builder, priority=10)
+    factory.register(
+        "*.collaborative.finance.*.*.*.*",
+        _researcher_builder_with_model(model, thread=thread),
+        priority=10,
+    )
 
     result = DemoResult()
 
@@ -276,10 +314,10 @@ async def run(
             source=AgentAddress.parse(HUMAN_URI),
             target=AgentAddress.parse(RESEARCHER_URI),
             verb="SEND-GET", code=Code.HUMAN_QUERY,
-            thread="thread::devin::cold", body=question,
+            thread=thread, body=question,
         )
         t0 = time.perf_counter()
-        result.first_reply = await engine.handle(cold_req, timeout=120.0)
+        result.first_reply = await engine.handle(cold_req, timeout=180.0)
         result.first_seconds = time.perf_counter() - t0
         if result.first_reply is not None:
             await show(result.first_reply.body)
@@ -289,7 +327,7 @@ async def run(
             source=AgentAddress.parse(HUMAN_URI),
             target=AgentAddress.parse(RESEARCHER_URI),
             verb="SEND-GET", code=Code.HUMAN_QUERY,
-            thread="thread::devin::warm", body=question,
+            thread=thread, body=question,
         )
         t0 = time.perf_counter()
         result.second_reply = await engine.handle(warm_req, timeout=10.0)
