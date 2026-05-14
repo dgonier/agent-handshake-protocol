@@ -35,6 +35,7 @@ from ahp.adapters.tool_registry import ToolRegistry
 from ahp.core.address import AgentAddress
 from ahp.core.pattern import AddressPattern
 from ahp.engine.router import ProtocolEngine
+from ahp.engine.scope import ScopePolicy
 
 
 Builder = Callable[[AgentAddress, ProtocolEngine, AgentProfile], AHPAgent]
@@ -89,6 +90,7 @@ class AgentFactory:
         tools: ToolRegistry | None = None,
         resources: ResourceRegistry | None = None,
         groups: GroupRegistry | None = None,
+        scope: ScopePolicy | None = None,
     ) -> None:
         self._engine = engine
         self._regs: list[_Registration] = []
@@ -96,9 +98,13 @@ class AgentFactory:
         self._tools = tools or ToolRegistry()
         self._resources = resources or ResourceRegistry()
         self._groups = groups or GroupRegistry()
+        self._scope = scope
         # Expose the group registry through the engine so adapters can
         # resolve a group name without needing a factory reference.
         engine.groups = self._groups
+        # Same for the (optional) scope policy. None = open default.
+        if scope is not None:
+            engine.scope = scope
 
     @property
     def capabilities(self) -> CapabilityRegistry:
@@ -115,6 +121,10 @@ class AgentFactory:
     @property
     def groups(self) -> GroupRegistry:
         return self._groups
+
+    @property
+    def scope(self) -> ScopePolicy | None:
+        return self._scope
 
     @property
     def engine(self) -> ProtocolEngine:

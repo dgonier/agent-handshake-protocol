@@ -659,6 +659,63 @@ uvicorn app:app --reload          # stub variant
 AHP_DEMO_VARIANT=react uvicorn app:app    # Bedrock-driven
 ```
 
+## Access control — `ScopePolicy`
+
+**Default is open.** Out of the box, any source can address any target;
+the protocol is permissive by design so single-tenant deployments stay
+ergonomic. To tighten progressively, attach a `ScopePolicy` and add
+allow rules over address patterns:
+
+```python
+from ahp.adapters import AgentFactory
+from ahp.engine import ScopePolicy
+
+scope = ScopePolicy()
+
+# Step 1 — only tifin agents can reach tifin's address space:
+scope.restrict(
+    target="tifin.*.*.*.*.*.*",
+    allow_sources="tifin.*.*.*.*.*.*",
+)
+
+# Step 2 — only finance agents touch the finance subdomain:
+scope.restrict(
+    target="tifin.*.finance.*.*.*.*",
+    allow_sources="tifin.*.finance.*.*.*.*",
+)
+
+# Step 3 — only adversarial agents can mutate the DB plane:
+scope.restrict(
+    target="tifin.db.adversarial.*.*.*.*",
+    allow_sources="tifin.adversarial.*.*.*.*.*",
+    code="collaborative.delegate",        # optional code glob filter
+)
+
+factory = AgentFactory(engine, scope=scope)   # wires engine.scope
+```
+
+Semantics:
+
+* **A target is "covered"** when at least one rule's `target` pattern
+  matches it. Uncovered targets remain open.
+* **Covered targets allow** any source matching any of the rules'
+  `allow_sources` patterns for that target (union).
+* **Tighter rules don't displace looser ones** — adding a narrower
+  rule with a narrower source pattern doesn't shrink access granted
+  by an existing broader rule. You shrink access by removing rules,
+  not by adding them.
+* **Point-to-point verbs** (`SEND`, `SEND-GET`) raise
+  `UnauthorizedError` on denial.
+* **Broadcast verbs** (`CAST`, `CAST-GET`) silently drop disallowed
+  targets — same UX as the compatibility matrix.
+* **`INVALIDATE` is not gated** by scope; cache control is a separate
+  plane.
+
+Scope is configured per-engine (each FastAPI process can carry its
+own policy), but because the addresses are universal, every node on
+the network should typically share the same policy or coordinate via
+a central source of truth.
+
 ## Federation — multiple processes, one network
 
 AHP addresses are universal strings. Any process that connects to the
@@ -702,7 +759,7 @@ dead.
 pytest
 ```
 
-344 tests passing + 1 cleanly skipped (live Bedrock smoke). Coverage
+356 tests passing + 1 cleanly skipped (live Bedrock smoke). Coverage
 across the library includes:
 
 * `test_agent_base.py` — register/deregister/start/stop, auto-reply,
@@ -747,7 +804,8 @@ ahp/
 ├── engine/
 │   ├── router.py         ProtocolEngine (verb dispatcher)
 │   ├── thread_manager.py ThreadManager + Thread
-│   └── errors.py         ProtocolError / IncompatibleTargetError / ...
+│   ├── scope.py          ScopePolicy + ScopeRule (open-default access control)
+│   └── errors.py         ProtocolError / IncompatibleTargetError / UnauthorizedError / ...
 ├── adapters/
 │   ├── base.py             AHPAgent
 │   ├── factory.py          AgentFactory + SpawnResult

@@ -39,7 +39,9 @@ from ahp.engine.errors import (
     IncompatibleTargetError,
     InvalidTargetTypeError,
     ProtocolError,
+    UnauthorizedError,
 )
+from ahp.engine.scope import ScopePolicy
 from ahp.engine.thread_manager import ThreadManager
 from ahp.registry.registry import AgentRegistry
 from ahp.transport.cache import ProtocolCache
@@ -65,6 +67,7 @@ class ProtocolEngine:
         *,
         default_timeout: float = DEFAULT_TIMEOUT,
         groups: Any = None,
+        scope: ScopePolicy | None = None,
     ) -> None:
         self.bus = bus
         self.registry = registry
@@ -76,6 +79,9 @@ class ProtocolEngine:
         # Kept here so adapters can resolve a group name without needing a
         # factory reference.
         self.groups = groups
+        # Optional access-control layer. Open-default — None means
+        # everyone can reach everyone (current behavior preserved).
+        self.scope = scope
 
     # ── entry point ─────────────────────────────────────────────────────
 
@@ -121,6 +127,7 @@ class ProtocolEngine:
     async def _handle_send(self, message: Message) -> int:
         target = self._require_address(message)
         self._check_compatibility(message.source, target, message.code)
+        self._check_scope(message.source, target, message.code)
         if not await self.registry.is_alive(target):
             log.debug("SEND to %s — target not alive", target)
             return 0
@@ -136,6 +143,7 @@ class ProtocolEngine:
             return cached
 
         self._check_compatibility(message.source, target, message.code)
+        self._check_scope(message.source, target, message.code)
         if not await self.registry.is_alive(target):
             return None
 
@@ -245,19 +253,51 @@ class ProtocolEngine:
                 f"code {code!r} (required: any of {sorted(tiers)})"
             )
 
+    def _check_scope(
+        self,
+        source: AgentAddress,
+        target: AgentAddress,
+        code: str,
+    ) -> None:
+        """Strict gate for point-to-point verbs. Raises on denial.
+
+        With no policy set, this is a no-op (open default).
+        """
+        if self.scope is None:
+            return
+        if not self.scope.is_allowed(source, target, code):
+            raise UnauthorizedError(
+                f"source {source} is not permitted to reach {target} "
+                f"for code {code!r} under the active ScopePolicy"
+            )
+
     async def _resolve_for_broadcast(self, message: Message) -> list[AgentAddress]:
-        """Resolve a broadcast message's target through registry + matrix.
+        """Resolve a broadcast message's target through registry + matrix + scope.
 
         Accepts either an :class:`AddressPattern` (normal case) or a
         concrete :class:`AgentAddress` (degenerate single-target broadcast).
+        Scope policy is applied as a silent filter — unauthorized targets
+        are dropped from the resolved set, mirroring how compatibility
+        filtering already works for broadcasts.
         """
         if isinstance(message.target, AgentAddress):
             if not await self.registry.is_alive(message.target):
                 return []
             if not self.matrix.can_route(message.source, message.target, message.code):
                 return []
+            if self.scope is not None and not self.scope.is_allowed(
+                message.source, message.target, message.code,
+            ):
+                return []
             return [message.target]
 
-        # Pattern: registry returns alive matches; matrix filters by accept.
+        # Pattern: registry returns alive matches; matrix + scope filter.
         candidates = await self.registry.resolve(message.target, alive_only=True)
-        return self.matrix.filter_targets(message.source, candidates, message.code)
+        candidates = self.matrix.filter_targets(
+            message.source, candidates, message.code,
+        )
+        if self.scope is not None:
+            candidates = self.scope.filter_targets(
+                message.source, candidates, message.code,
+            )
+        return candidates
