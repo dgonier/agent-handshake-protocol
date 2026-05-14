@@ -29,6 +29,8 @@ from ahp.adapters.provisioning import (
     ProvisioningPattern,
     default_namer,
 )
+from ahp.adapters.resources import ResourceRegistry
+from ahp.adapters.tool_registry import ToolRegistry
 from ahp.core.address import AgentAddress
 from ahp.core.pattern import AddressPattern
 from ahp.engine.router import ProtocolEngine
@@ -83,21 +85,52 @@ class AgentFactory:
         self,
         engine: ProtocolEngine,
         capabilities: CapabilityRegistry | None = None,
+        tools: ToolRegistry | None = None,
+        resources: ResourceRegistry | None = None,
     ) -> None:
         self._engine = engine
         self._regs: list[_Registration] = []
         self._capabilities = capabilities or CapabilityRegistry()
+        self._tools = tools or ToolRegistry()
+        self._resources = resources or ResourceRegistry()
 
     @property
     def capabilities(self) -> CapabilityRegistry:
         return self._capabilities
 
+    @property
+    def tools(self) -> ToolRegistry:
+        return self._tools
+
+    @property
+    def resources(self) -> ResourceRegistry:
+        return self._resources
+
+    @property
+    def engine(self) -> ProtocolEngine:
+        return self._engine
+
     def profile_for(self, address: AgentAddress | str) -> AgentProfile:
+        """Build the merged :class:`AgentProfile` for ``address``.
+
+        Combines:
+
+        * Capability-registry contributions (inline tools, skills,
+          prompt fragments, agent_kind).
+        * Tool-registry tools whose ``allowed_for`` pattern matches.
+        * Resource-registry resources whose ``allowed_for`` pattern
+          matches (lazily constructed on first access).
+        """
         addr = (
             address if isinstance(address, AgentAddress)
             else AgentAddress.parse(address)
         )
-        return self._capabilities.resolve(addr)
+        base = self._capabilities.resolve(addr)
+        extra_tools = self._tools.for_address(addr)
+        if extra_tools:
+            base.tools = tuple(base.tools) + tuple(extra_tools)
+        base.resources = self._resources.for_address(addr)
+        return base
 
     # ── registration ────────────────────────────────────────────────────
 
@@ -135,14 +168,15 @@ class AgentFactory:
     def create(self, address: AgentAddress | str) -> AHPAgent:
         """Build the agent for ``address`` using the first matching builder.
 
-        The builder receives the address-resolved :class:`AgentProfile`
-        as its third argument.
+        The builder receives the merged :class:`AgentProfile` (capability
+        registry + tool registry + resource registry) as its third
+        argument.
         """
         addr = (
             address if isinstance(address, AgentAddress)
             else AgentAddress.parse(address)
         )
-        profile = self._capabilities.resolve(addr)
+        profile = self.profile_for(addr)
         for reg in self._regs:
             if reg.pattern.matches(addr):
                 return reg.builder(addr, self._engine, profile)

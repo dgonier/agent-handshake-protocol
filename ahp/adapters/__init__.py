@@ -1,4 +1,4 @@
-"""ahp.adapters — agent base class, factory, and framework adapters.
+"""ahp.adapters — agent base class, factory, registries, and adapters.
 
 Always-importable (no optional deps):
 
@@ -6,13 +6,17 @@ Always-importable (no optional deps):
 * :class:`AgentFactory` — pattern-keyed agent construction + bulk spawn
 * :class:`HumanAgent`
 * :class:`ProvisioningPattern` — bulk-spawn spec with N*/star-N syntax
+* :class:`ToolRegistry` / :class:`ToolAddress` / :func:`tool`
+* :class:`ResourceRegistry` / :class:`ResourceAddress` / :func:`resource`
+* :class:`CapabilityRegistry`
 
 Framework-specific adapters live in their own submodules and are
-imported only on demand so the optional deps stay optional:
+imported only on demand so the optional deps stay opt-in:
 
 * ``from ahp.adapters.langgraph_agent import LangGraphAgent, DeepAgentDAG``
-  (requires ``langgraph``)
-* ``from ahp.adapters.dspy_agent import DSPyAgent`` (requires ``dspy-ai``)
+* ``from ahp.adapters.react_agent import ReactAgent``
+* ``from ahp.adapters.deep_agent import DeepAgent``
+* ``from ahp.adapters.dspy_agent import DSPyAgent``
 """
 
 from ahp.adapters.base import AHPAgent
@@ -27,14 +31,24 @@ from ahp.adapters.capability import (
 )
 from ahp.adapters.factory import AgentFactory, Builder, SpawnResult
 from ahp.adapters.human import HumanAgent, ObservationLevel
-# ReactAgent + framework adapters live in their own submodules so the
-# optional deps (langgraph, langchain) stay opt-in. Importable on demand:
-#   from ahp.adapters.react_agent import ReactAgent
 from ahp.adapters.provisioning import (
     FieldNamer,
     ProvisioningField,
     ProvisioningPattern,
     default_namer,
+)
+from ahp.adapters.resources import (
+    DEFAULT_RESOURCE_REGISTRY,
+    ResourceBinding,
+    ResourceRegistry,
+    resource,
+)
+from ahp.adapters.tool_address import ResourceAddress, ToolAddress
+from ahp.adapters.tool_registry import (
+    DEFAULT_TOOL_REGISTRY,
+    ToolBinding,
+    ToolRegistry,
+    tool,
 )
 
 __all__ = [
@@ -45,14 +59,24 @@ __all__ = [
     "Builder",
     "CapabilityProvider",
     "CapabilityRegistry",
+    "DEFAULT_RESOURCE_REGISTRY",
+    "DEFAULT_TOOL_REGISTRY",
     "FieldNamer",
     "HumanAgent",
     "ObservationLevel",
     "ProvisioningField",
     "ProvisioningPattern",
     "RagSource",
+    "ResourceAddress",
+    "ResourceBinding",
+    "ResourceRegistry",
     "Skill",
     "SpawnResult",
     "Tool",
+    "ToolAddress",
+    "ToolBinding",
+    "ToolRegistry",
     "default_namer",
+    "resource",
+    "tool",
 ]

@@ -24,7 +24,8 @@ translate to their respective tool/skill primitives.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Iterable, Literal, Optional
+from types import MappingProxyType
+from typing import Any, Awaitable, Callable, Iterable, Literal, Mapping, Optional
 
 from ahp.core.address import AgentAddress
 from ahp.core.pattern import AddressPattern
@@ -82,16 +83,24 @@ class RagSource:
     description: str = ""
 
 
-@dataclass(frozen=True)
+@dataclass
 class AgentProfile:
-    """Resolved configuration for an agent at a specific address."""
+    """Resolved configuration for an agent at a specific address.
+
+    ``tools`` and ``skills`` come from the capability registry (inline)
+    plus the tool registry (address-keyed). ``resources`` is a
+    ``{name: instance}`` map of lazy-constructed shared objects pulled
+    from the resource registry — agents grab a DB client / vector
+    store / FS backend by name and use it inside their tool handlers.
+    """
 
     address: AgentAddress
-    tools: tuple[Tool, ...] = ()
-    skills: tuple[Skill, ...] = ()
-    rag_sources: tuple[RagSource, ...] = ()
+    tools: tuple[Tool, ...] = field(default_factory=tuple)
+    skills: tuple[Skill, ...] = field(default_factory=tuple)
+    rag_sources: tuple[RagSource, ...] = field(default_factory=tuple)
     prompt: str = ""
     agent_kind: AgentKind = "react"
+    resources: dict[str, Any] = field(default_factory=dict)
 
     @property
     def all_tools(self) -> tuple[Tool, ...]:

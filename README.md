@@ -18,8 +18,8 @@ runnable end-to-end demo.
 | 1 | `ahp.core` (addresses, patterns, codes, messages, compatibility) | implemented |
 | 2 | `ahp.transport` (RedisBus, ProtocolCache), `ahp.registry` | implemented |
 | 3 | `ahp.engine` (ProtocolEngine, ThreadManager) | implemented |
-| 4 | `ahp.adapters` (AHPAgent, LangGraph, DSPy, deep agent, human, factory, provisioning, capabilities) | implemented |
-| 5 | `ahp.demo.finance_analysis` (runnable end-to-end demo) | implemented |
+| 4 | `ahp.adapters` (AHPAgent, LangGraph, DSPy, deep agent, human, factory, provisioning, capabilities, tool/resource registries, MCP passthrough) | implemented |
+| 5 | `ahp.demo.finance_analysis` (stubbed) + `ahp.demo.finance_react` (Bedrock) + `ahp.demo.serve` (FastAPI) | implemented |
 
 ## Install
 
@@ -365,6 +365,85 @@ result = await factory.spawn_and_start(
 print(len(result.new), len(result.reused))   # → 4, 0
 ```
 
+## Addressable tools — `ToolRegistry`
+
+Tools are first-class citizens with their own 5-field address:
+
+```
+{scope}.{kind}.{role}.{category}.{operation}
+```
+
+Register declaratively with the `@tool` decorator — the operation
+defaults to the function's name, and access scope is derived from the
+address (a tool with `scope=tifin, role=adversarial` is auto-visible
+to any `tifin.adversarial.*.*.*.*.*` agent):
+
+```python
+from ahp.adapters import tool
+
+@tool("tifin", "db", "adversarial", "crud")
+def update_record(table: str, row_id: str, fields: dict) -> dict:
+    """Update a row in the table."""
+    return run_sql(...)
+
+# → registered at ToolAddress("tifin", "db", "adversarial", "crud",
+#                              "update_record")
+# → default allowed_for: agents matching "tifin.adversarial.*.*.*.*.*"
+```
+
+Override the convention with explicit `allowed_for=` or tag tools for
+selective inclusion (`tags=["read-only", "slow"]`, then
+`registry.for_address(addr, tags=["read-only"])`).
+
+## Addressable resources — `ResourceRegistry`
+
+Long-lived shared objects (vector stores, DB clients, API SDKs, FS
+backends) have parallel `{scope}.{kind}.{domain}.{subdomain}.{name}`
+addresses. Lazy-instantiated on first access, torn down via
+`close_all()` during shutdown. Default access scope is by
+`org/domain/subdomain` (shared across roles):
+
+```python
+from ahp.adapters import resource
+
+@resource("tifin", "fs", "finance", "documents")
+class FinanceDocs:
+    def __init__(self):
+        self.root = "/data/finance"
+    def aclose(self):                       # auto-detected for cleanup
+        ...
+
+@resource("tifin", "vector", "finance", "filings",
+          name="sec-edgar", cleanup=lambda c: c.aclose())
+def make_sec_vector():
+    return ChromaClient(...)
+```
+
+Agents matching the resource's `allowed_for` pattern get a
+`profile.resources["sec-edgar"]` map handed to their builder — tools
+inside the agent grab the client by name.
+
+## MCP passthrough
+
+Register an entire MCP server's tool surface under one scope:
+
+```python
+from ahp.adapters.mcp import register_mcp_server
+
+await register_mcp_server(
+    factory.tools, factory.resources,
+    scope="tifin", kind="api", role="*", category="mcp-github",
+    connection={"command": "uvx", "args": ["mcp-server-github"],
+                "transport": "stdio"},
+)
+```
+
+Every tool the MCP server exposes (e.g. `search_repos`, `get_issue`)
+is now addressable as `tifin.api.*.mcp-github.<tool_name>` and gets
+auto-bound to agents whose address matches the derived pattern. The
+MCP client itself is registered as a `Resource` so its connection is
+closed on shutdown. Optional dep: `pip install -e ".[mcp]"`.
+
 ## Capabilities — `CapabilityRegistry`
 
 Address fields drive agent configuration: `domain`/`subdomain` selects
@@ -526,14 +605,52 @@ so the LLM demo's wiring is exercised in CI without hitting AWS. The
 live Bedrock path is gated behind `AHP_RUN_BEDROCK=1` so it stays
 opt-in.
 
+## Hosting it — `ahp.serve` (FastAPI)
+
+A FastAPI process IS the AHP runtime. `build_app(factory, agents=...)`
+returns an app that registers/starts the agents on lifespan boot,
+exposes the protocol over HTTP/WebSocket, and gives the factory
+"self-callable" access from inside HTTP handlers.
+
+```python
+from ahp.serve import build_app
+
+app = build_app(factory, agents=[bull, bear, researcher, human])
+# uvicorn my_module:app
+```
+
+Endpoints:
+
+| Verb | Path | Purpose |
+|------|------|---------|
+| POST | `/query`           | HUMAN_QUERY → target (SEND-GET) |
+| POST | `/send`            | arbitrary AHP message → engine.handle() |
+| GET  | `/agents`          | list registered agents |
+| GET  | `/threads/{id}`    | read thread history (optional `tier_filter=`) |
+| GET  | `/tools`           | list registered tool addresses |
+| GET  | `/resources`       | list registered resource addresses |
+| WS   | `/observe`         | live CAST-SUB stream over the bus tap |
+
+The included `ahp.demo.serve` boots a complete runnable process:
+
+```bash
+uvicorn ahp.demo.serve:app --reload
+# stub variant (deterministic, no LLM, no AWS)
+AHP_DEMO_VARIANT=react uvicorn ahp.demo.serve:app
+# Bedrock-driven, requires AWS credentials
+```
+
+Install extras: `pip install -e ".[serve]"` (pulls `fastapi`,
+`uvicorn`, `httpx`).
+
 ## Tests
 
 ```bash
 pytest
 ```
 
-273 tests passing + 1 cleanly skipped (live Bedrock smoke). Phase 4 / 5
-/ 6 coverage includes:
+338 tests passing + 1 cleanly skipped (live Bedrock smoke). Phase 4 / 5
+/ 6 / 7 / 8 / 9 coverage includes:
 
 * `test_agent_base.py` — register/deregister/start/stop, auto-reply,
   handler exception → `error.internal` wrapping, send/broadcast helpers.
@@ -587,8 +704,14 @@ ahp/
 │   ├── langgraph_agent.py  LangGraphAgent + DeepAgentDAG  (needs langgraph)
 │   └── dspy_agent.py       DSPyAgent  (needs dspy-ai)
 ├── adapters/
+│   ├── tool_address.py   ToolAddress + ResourceAddress
+│   ├── tool_registry.py  ToolRegistry + @tool decorator
+│   ├── resources.py      ResourceRegistry + @resource decorator
+│   ├── mcp.py            register_mcp_server + register_mcp_tools
 │   ├── react_agent.py    ReactAgent (wraps create_react_agent)
 │   └── deep_agent.py     DeepAgent (wraps deepagents.create_deep_agent)
+├── serve/
+│   └── fastapi_app.py    build_app(factory, agents=...) FastAPI face
 ├── llm/
 │   └── bedrock.py        ChatBedrockConverse helper + has_aws_credentials()
 └── demo/
