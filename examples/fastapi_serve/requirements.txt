@@ -1,0 +1,8 @@
+# Extra dependencies for the FastAPI consumer of `ahp`.
+# Install `ahp` itself from the repo root: `pip install -e ../../`
+fastapi>=0.110
+uvicorn[standard]>=0.27
+httpx>=0.27
+# Demo uses fakeredis to avoid requiring a live Redis. In production
+# swap to a real `redis` URL via `RedisBus.from_url(...)`.
+fakeredis>=2.20

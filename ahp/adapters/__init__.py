@@ -30,6 +30,12 @@ from ahp.adapters.capability import (
     Tool,
 )
 from ahp.adapters.factory import AgentFactory, Builder, SpawnResult
+from ahp.adapters.groups import (
+    DEFAULT_GROUP_REGISTRY,
+    Group,
+    GroupRegistry,
+    group,
+)
 from ahp.adapters.human import HumanAgent, ObservationLevel
 from ahp.adapters.provisioning import (
     FieldNamer,
@@ -59,9 +65,12 @@ __all__ = [
     "Builder",
     "CapabilityProvider",
     "CapabilityRegistry",
+    "DEFAULT_GROUP_REGISTRY",
     "DEFAULT_RESOURCE_REGISTRY",
     "DEFAULT_TOOL_REGISTRY",
     "FieldNamer",
+    "Group",
+    "GroupRegistry",
     "HumanAgent",
     "ObservationLevel",
     "ProvisioningField",
@@ -77,6 +86,7 @@ __all__ = [
     "ToolBinding",
     "ToolRegistry",
     "default_namer",
+    "group",
     "resource",
     "tool",
 ]

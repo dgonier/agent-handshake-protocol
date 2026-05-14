@@ -24,6 +24,7 @@ from typing import Callable
 
 from ahp.adapters.base import AHPAgent
 from ahp.adapters.capability import AgentProfile, CapabilityRegistry
+from ahp.adapters.groups import GroupRegistry
 from ahp.adapters.provisioning import (
     FieldNamer,
     ProvisioningPattern,
@@ -87,12 +88,17 @@ class AgentFactory:
         capabilities: CapabilityRegistry | None = None,
         tools: ToolRegistry | None = None,
         resources: ResourceRegistry | None = None,
+        groups: GroupRegistry | None = None,
     ) -> None:
         self._engine = engine
         self._regs: list[_Registration] = []
         self._capabilities = capabilities or CapabilityRegistry()
         self._tools = tools or ToolRegistry()
         self._resources = resources or ResourceRegistry()
+        self._groups = groups or GroupRegistry()
+        # Expose the group registry through the engine so adapters can
+        # resolve a group name without needing a factory reference.
+        engine.groups = self._groups
 
     @property
     def capabilities(self) -> CapabilityRegistry:
@@ -105,6 +111,10 @@ class AgentFactory:
     @property
     def resources(self) -> ResourceRegistry:
         return self._resources
+
+    @property
+    def groups(self) -> GroupRegistry:
+        return self._groups
 
     @property
     def engine(self) -> ProtocolEngine:

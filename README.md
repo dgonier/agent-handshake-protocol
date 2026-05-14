@@ -605,43 +605,59 @@ so the LLM demo's wiring is exercised in CI without hitting AWS. The
 live Bedrock path is gated behind `AHP_RUN_BEDROCK=1` so it stays
 opt-in.
 
-## Hosting it — `ahp.serve` (FastAPI)
+## Broadcast by name — `GroupRegistry`
 
-A FastAPI process IS the AHP runtime. `build_app(factory, agents=...)`
-returns an app that registers/starts the agents on lifespan boot,
-exposes the protocol over HTTP/WebSocket, and gives the factory
-"self-callable" access from inside HTTP handlers.
+Name a pattern, broadcast by string:
 
 ```python
-from ahp.serve import build_app
+from ahp.adapters import AgentFactory, GroupRegistry
 
-app = build_app(factory, agents=[bull, bear, researcher, human])
-# uvicorn my_module:app
+groups = GroupRegistry()
+groups.register("debaters",     "*.adversarial.*.*.*.*.*")
+groups.register("research-team", "*.collaborative.finance.*.s.*.*")
+
+factory = AgentFactory(engine, groups=groups)  # wires engine.groups
+
+# Now any agent can fan out by a single string:
+replies = await alice.broadcast_to(
+    "debaters",                            # ← simple group name
+    code=Code.ADVERSARIAL_DEBATE,
+    body="argue Tesla",
+)
 ```
 
-Endpoints:
+Resolution order on `broadcast_to(name_or_pattern, ...)`:
+1. Already an `AddressPattern` → used as-is.
+2. Registered group name → its pattern.
+3. Otherwise the string is parsed as a 7-field pattern (so ad-hoc
+   patterns and named groups can mix at the same call site).
+
+## Hosting it behind HTTP
+
+FastAPI is intentionally NOT a dependency of `ahp`. A complete FastAPI
+consumer that turns the library into a runnable service lives in
+[`examples/fastapi_serve/`](examples/fastapi_serve/) — copy the
+directory into your own project as a starting point.
+
+The example wires `AgentFactory` + agents inside a FastAPI lifespan
+and exposes the protocol over HTTP/WebSocket:
 
 | Verb | Path | Purpose |
 |------|------|---------|
 | POST | `/query`           | HUMAN_QUERY → target (SEND-GET) |
-| POST | `/send`            | arbitrary AHP message → engine.handle() |
+| POST | `/send`            | arbitrary AHP message |
 | GET  | `/agents`          | list registered agents |
-| GET  | `/threads/{id}`    | read thread history (optional `tier_filter=`) |
-| GET  | `/tools`           | list registered tool addresses |
-| GET  | `/resources`       | list registered resource addresses |
+| GET  | `/threads/{id}`    | read thread history |
+| GET  | `/tools`           | list tool addresses |
+| GET  | `/resources`       | list resource addresses |
 | WS   | `/observe`         | live CAST-SUB stream over the bus tap |
 
-The included `ahp.demo.serve` boots a complete runnable process:
-
 ```bash
-uvicorn ahp.demo.serve:app --reload
-# stub variant (deterministic, no LLM, no AWS)
-AHP_DEMO_VARIANT=react uvicorn ahp.demo.serve:app
-# Bedrock-driven, requires AWS credentials
+cd examples/fastapi_serve
+pip install -r requirements.txt
+uvicorn app:app --reload          # stub variant
+AHP_DEMO_VARIANT=react uvicorn app:app    # Bedrock-driven
 ```
-
-Install extras: `pip install -e ".[serve]"` (pulls `fastapi`,
-`uvicorn`, `httpx`).
 
 ## Tests
 
@@ -649,8 +665,8 @@ Install extras: `pip install -e ".[serve]"` (pulls `fastapi`,
 pytest
 ```
 
-338 tests passing + 1 cleanly skipped (live Bedrock smoke). Phase 4 / 5
-/ 6 / 7 / 8 / 9 coverage includes:
+339 tests passing + 1 cleanly skipped (live Bedrock smoke). Coverage
+across the library includes:
 
 * `test_agent_base.py` — register/deregister/start/stop, auto-reply,
   handler exception → `error.internal` wrapping, send/broadcast helpers.
@@ -707,16 +723,21 @@ ahp/
 │   ├── tool_address.py   ToolAddress + ResourceAddress
 │   ├── tool_registry.py  ToolRegistry + @tool decorator
 │   ├── resources.py      ResourceRegistry + @resource decorator
+│   ├── groups.py         GroupRegistry (named pattern aliases)
 │   ├── mcp.py            register_mcp_server + register_mcp_tools
 │   ├── react_agent.py    ReactAgent (wraps create_react_agent)
 │   └── deep_agent.py     DeepAgent (wraps deepagents.create_deep_agent)
-├── serve/
-│   └── fastapi_app.py    build_app(factory, agents=...) FastAPI face
 ├── llm/
 │   └── bedrock.py        ChatBedrockConverse helper + has_aws_credentials()
 └── demo/
     ├── finance_analysis.py end-to-end pipeline (deterministic stubs)
     └── finance_react.py    same pipeline, Bedrock-driven Bull + Bear
+examples/
+└── fastapi_serve/         FastAPI consumer of the library (NOT in `ahp/`)
+    ├── server.py          generic build_app(factory, agents=...)
+    ├── app.py             wires the finance demo behind HTTP
+    ├── requirements.txt
+    └── README.md
 tests/
     test_address.py  test_pattern.py  test_codes.py  test_message.py
     test_compatibility.py  test_keys.py

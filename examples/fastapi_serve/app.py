@@ -1,10 +1,15 @@
-"""Runnable FastAPI process: the finance demo behind HTTP.
+"""Runnable FastAPI process: the AHP finance demo behind HTTP.
 
-Run with::
+This is a *consumer* of the ``ahp`` package — FastAPI itself is NOT a
+dependency of the library. Treat this directory as a starting point
+to copy into your own service.
 
-    uvicorn ahp.demo.serve:app --reload
+Run from this directory::
 
-Endpoints (see :mod:`ahp.serve` for full details):
+    pip install -r requirements.txt
+    uvicorn app:app --reload
+
+Endpoints (see ``server.py``):
 
 * ``POST /query``         — ``{ "target": "...researcher", "body": "Tesla" }``
 * ``POST /send``          — arbitrary AHP message
@@ -16,7 +21,7 @@ Endpoints (see :mod:`ahp.serve` for full details):
   ``ws://host/observe?pattern=*.adversarial.*.*.*.*.*&code=adversarial.*``
 
 By default this boots the stubbed (no-LLM) finance stack — same
-agents as :mod:`ahp.demo.finance_analysis`. To use the Bedrock-backed
+agents as ``ahp.demo.finance_analysis``. To use the Bedrock-backed
 variant, set ``AHP_DEMO_VARIANT=react`` before starting uvicorn.
 """
 
@@ -42,8 +47,8 @@ from ahp.demo.finance_analysis import (
 )
 from ahp.engine import ProtocolEngine
 from ahp.registry import AgentRegistry
-from ahp.serve import build_app
 from ahp.transport import ProtocolCache, RedisBus
+from server import build_app    # local module — sits next to this file
 
 
 def _build_stub_app():

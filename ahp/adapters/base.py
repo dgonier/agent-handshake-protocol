@@ -136,6 +136,48 @@ class AHPAgent(ABC):
             pattern, code, body, verb=verb, thread=thread, **kwargs,
         )
 
+    async def broadcast_to(
+        self,
+        group_or_pattern: str | AddressPattern,
+        code: str,
+        body: Any,
+        *,
+        verb: str = "CAST-GET",
+        thread: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Broadcast by group name or raw pattern — the one-liner version.
+
+        ``group_or_pattern`` is resolved through the engine's
+        :class:`GroupRegistry` (if one was wired in by a factory):
+
+        1. A registered group name → its pattern.
+        2. Already an :class:`AddressPattern` → used as-is.
+        3. Otherwise the string is parsed as a 7-field pattern.
+
+        Example::
+
+            replies = await agent.broadcast_to(
+                "debaters",
+                code=Code.ADVERSARIAL_DEBATE,
+                body="argue Tesla",
+            )
+        """
+        pattern = self._resolve_group(group_or_pattern)
+        return await self.send(
+            pattern, code, body, verb=verb, thread=thread, **kwargs,
+        )
+
+    def _resolve_group(
+        self, name_or_pattern: str | AddressPattern,
+    ) -> AddressPattern:
+        if isinstance(name_or_pattern, AddressPattern):
+            return name_or_pattern
+        groups = getattr(self.engine, "groups", None)
+        if groups is not None:
+            return groups.resolve(name_or_pattern)
+        return AddressPattern.parse(name_or_pattern)
+
     # ── internals ───────────────────────────────────────────────────────
 
     async def _dispatch(self, message: Message) -> None:

@@ -64,6 +64,7 @@ class ProtocolEngine:
         threads: ThreadManager | None = None,
         *,
         default_timeout: float = DEFAULT_TIMEOUT,
+        groups: Any = None,
     ) -> None:
         self.bus = bus
         self.registry = registry
@@ -71,6 +72,10 @@ class ProtocolEngine:
         self.matrix = matrix or CompatibilityMatrix()
         self.threads = threads or ThreadManager(bus.redis, bus)
         self.default_timeout = default_timeout
+        # Group registry is set lazily by the factory if one was supplied.
+        # Kept here so adapters can resolve a group name without needing a
+        # factory reference.
+        self.groups = groups
 
     # ── entry point ─────────────────────────────────────────────────────
 
