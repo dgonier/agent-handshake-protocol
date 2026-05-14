@@ -26,6 +26,15 @@ class Keys:
         """Ephemeral channel used to collect responses for SEND-GET / CAST-GET."""
         return f"{PREFIX}:reply:{message_id}"
 
+    @staticmethod
+    def tap_channel() -> str:
+        """Single fan-out channel that mirrors every published message.
+
+        CAST-SUB subscribers consume this channel and filter in Python by
+        :class:`AddressPattern` and :class:`Code` glob.
+        """
+        return f"{PREFIX}:tap"
+
     # ── streams ──────────────────────────────────────────────────────
     @staticmethod
     def thread_stream(thread_id: str) -> str:

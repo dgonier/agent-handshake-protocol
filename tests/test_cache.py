@@ -122,6 +122,33 @@ async def test_param_order_irrelevant_for_key(cache: ProtocolCache):
     assert ProtocolCache.derive_key(a) == ProtocolCache.derive_key(b)
 
 
+async def test_distinct_bodies_yield_distinct_keys(cache: ProtocolCache):
+    """Different request bodies must NOT collide on the same cache slot."""
+    a = _request(body="Tesla")
+    b = _request(body="Apple")
+    assert ProtocolCache.derive_key(a) != ProtocolCache.derive_key(b)
+
+
+async def test_dict_body_order_irrelevant_for_key(cache: ProtocolCache):
+    a = _request(body={"horizon": 12, "ticker": "Tesla"})
+    b = _request(body={"ticker": "Tesla", "horizon": 12})
+    assert ProtocolCache.derive_key(a) == ProtocolCache.derive_key(b)
+
+
+async def test_distinct_bodies_dont_share_cached_response(cache: ProtocolCache):
+    """End-to-end: two different queries against the same (target, code)
+    must return their respective responses, not the first-seen answer."""
+    req_tesla = _request(body="Tesla")
+    req_apple = _request(body="Apple")
+    await cache.put(req_tesla, _response_to(req_tesla, "tesla-answer"))
+    await cache.put(req_apple, _response_to(req_apple, "apple-answer"))
+
+    tesla_hit = await cache.get(req_tesla)
+    apple_hit = await cache.get(req_apple)
+    assert tesla_hit is not None and tesla_hit.body == "tesla-answer"
+    assert apple_hit is not None and apple_hit.body == "apple-answer"
+
+
 # ── invalidation ────────────────────────────────────────────────────────
 
 

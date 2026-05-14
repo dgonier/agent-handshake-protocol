@@ -236,8 +236,32 @@ n = await engine.handle(invalidate_msg)               # int
 
 Return shapes by verb: `SEND` → delivery count; `SEND-GET` → response
 or `None` (cache hits short-circuit the bus); `CAST` → fan-out count;
-`CAST-GET` → list of responses; `INVALIDATE` → entries cleared.
-`CAST-SUB` is reserved for Phase 4.
+`CAST-GET` → list of responses; `CAST-SUB` → a `Subscription` over
+matching tap traffic; `INVALIDATE` → entries cleared.
+
+The cache key combines the target address, the code, and a digest of
+the request body — so two queries with different bodies against the
+same `(target, code)` don't collide on a cache slot.
+
+`CAST-SUB` opens a long-lived `Subscription` on the bus's tap channel
+(every published message is mirrored to it). The engine builds a
+predicate from the verb's pattern target + code glob:
+
+```python
+sub = await engine.handle(Message(
+    source=alice,
+    target=AddressPattern.parse("*.adversarial.*.*.*.*.*"),
+    verb="CAST-SUB",
+    code="adversarial.*",   # glob — matches every adversarial.* code
+    thread="thread::observer",
+    body=None,
+))
+async for msg in sub.messages():
+    print(msg.source, msg.code, msg.body)
+```
+
+Concrete-address targets are supported too — useful when you want to
+audit every message addressed to a specific agent.
 
 Errors raised: `IncompatibleTargetError` when the target's accept set
 doesn't satisfy the code's tier requirements; `InvalidTargetTypeError`

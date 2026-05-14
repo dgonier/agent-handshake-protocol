@@ -424,14 +424,97 @@ async def test_invalidate_with_params(stack):
 # ── CAST-SUB / spawn_thread ─────────────────────────────────────────────
 
 
-async def test_cast_sub_not_implemented(stack):
-    msg = _msg(
-        target=AddressPattern.parse("*.*.*.*.*.*.*"),
+async def test_cast_sub_returns_filtered_subscription(stack):
+    """CAST-SUB hands back a Subscription that only forwards matching messages."""
+    sub = await stack.engine.handle(_msg(
+        target=AddressPattern.parse("*.adversarial.*.*.*.*.*"),
         verb="CAST-SUB",
-        body=None,
-    )
-    with pytest.raises(NotImplementedError):
-        await stack.engine.handle(msg)
+        code="interview.*",  # only interview-family codes pass the filter
+    ))
+    await asyncio.sleep(0.05)  # let the tap subscription land
+    try:
+        # Send a message that should pass: target adversarial, code interview.text
+        await _register(stack, BOB_URI)
+        await stack.engine.handle(_msg(
+            target=BOB_URI, verb="SEND",
+            code=Code.INTERVIEW_TEXT, body="hit",
+        ))
+        # Send one that should NOT pass: target collaborative
+        await _register(stack, "demo.collaborative.finance.equities.s.session.alice2")
+        await stack.engine.handle(_msg(
+            source=ALICE_URI,
+            target="demo.collaborative.finance.equities.s.session.alice2",
+            verb="SEND",
+            code=Code.INTERVIEW_TEXT, body="miss-role",
+        ))
+        # And one that should NOT pass: right role, wrong code family
+        await stack.engine.handle(_msg(
+            target=BOB_URI, verb="SEND",
+            code=Code.ADVERSARIAL_DEBATE, body="miss-code",
+        ))
+
+        captured: list = []
+        for _ in range(3):
+            m = await sub.get_one(timeout=0.5)
+            if m is None:
+                break
+            captured.append(m.body)
+
+        assert "hit" in captured
+        assert "miss-role" not in captured
+        assert "miss-code" not in captured
+    finally:
+        await sub.close()
+
+
+async def test_cast_sub_with_concrete_address_target(stack):
+    """CAST-SUB on a concrete AgentAddress only delivers messages to that address."""
+    await _register(stack, BOB_URI, CAROL_URI)
+    sub = await stack.engine.handle(_msg(
+        target=BOB_URI,
+        verb="CAST-SUB",
+        code="*",  # any code
+    ))
+    await asyncio.sleep(0.05)
+    try:
+        await stack.engine.handle(_msg(target=BOB_URI, verb="SEND", body="for-bob"))
+        await stack.engine.handle(_msg(target=CAROL_URI, verb="SEND", body="for-carol"))
+
+        bodies: list = []
+        for _ in range(2):
+            m = await sub.get_one(timeout=0.5)
+            if m is None:
+                break
+            bodies.append(m.body)
+        assert bodies == ["for-bob"]
+    finally:
+        await sub.close()
+
+
+async def test_cast_sub_observes_broadcast_via_source(stack):
+    """For pattern-target broadcasts, the subscriber sees them via source-pattern match."""
+    await _register(stack, BOB_URI, CAROL_URI)
+    sub = await stack.engine.handle(_msg(
+        target=AddressPattern.parse("*.collaborative.*.*.*.*.*"),
+        verb="CAST-SUB",
+        code="adversarial.*",
+    ))
+    await asyncio.sleep(0.05)
+    try:
+        # alice (collaborative) broadcasts an adversarial.debate to *.adversarial.*
+        await stack.engine.handle(_msg(
+            source=ALICE_URI,
+            target=AddressPattern.parse("*.adversarial.*.*.*.*.*"),
+            verb="CAST",
+            code=Code.ADVERSARIAL_DEBATE,
+            body="alice-debates",
+        ))
+        m = await sub.get_one(timeout=0.5)
+        assert m is not None
+        assert m.body == "alice-debates"
+        assert m.source.instance == "alice"
+    finally:
+        await sub.close()
 
 
 async def test_spawn_thread_creates_durable_thread(stack):

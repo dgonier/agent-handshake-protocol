@@ -20,7 +20,7 @@ Return shapes by verb:
 ``SEND-GET``      ``Message | None`` (or cached ``Message``)
 ``CAST``          ``int`` total deliveries across resolved targets
 ``CAST-GET``      ``list[Message]``
-``CAST-SUB``      not yet implemented (Phase 4)
+``CAST-SUB``      :class:`Subscription` over matching tap traffic
 ``INVALIDATE``    ``int`` cache entries invalidated
 ================  ====================
 """
@@ -31,6 +31,7 @@ import logging
 from typing import Any
 
 from ahp.core.address import AgentAddress
+from ahp.core.codes import Code
 from ahp.core.compatibility import CompatibilityMatrix
 from ahp.core.message import Message
 from ahp.core.pattern import AddressPattern
@@ -42,7 +43,7 @@ from ahp.engine.errors import (
 from ahp.engine.thread_manager import ThreadManager
 from ahp.registry.registry import AgentRegistry
 from ahp.transport.cache import ProtocolCache
-from ahp.transport.redis_bus import RedisBus
+from ahp.transport.redis_bus import RedisBus, Subscription
 
 
 log = logging.getLogger(__name__)
@@ -158,11 +159,51 @@ class ProtocolEngine:
             message, targets, timeout=timeout, max_responses=max_responses,
         )
 
-    async def _handle_cast_sub(self, message: Message) -> Any:
-        raise NotImplementedError(
-            "CAST-SUB is reserved for Phase 4 (long-lived pattern subscriptions); "
-            "use bus.listen() directly for now"
-        )
+    async def _handle_cast_sub(self, message: Message) -> Subscription:
+        """Open a long-lived subscription on the bus's tap channel.
+
+        The returned :class:`Subscription` yields every message whose code
+        matches ``message.code`` (treated as a hierarchical glob, so
+        ``"interview.*"`` matches any interview verb) AND whose
+        target/source matches ``message.target`` when the latter is an
+        :class:`AddressPattern`. A concrete :class:`AgentAddress` target
+        is treated as "subscribe to messages addressed to exactly this
+        address."
+
+        The caller owns the subscription's lifetime — call
+        :meth:`Subscription.close` when done.
+        """
+        target = message.target
+        code_glob = message.code
+
+        if isinstance(target, AddressPattern):
+            pattern: AddressPattern | None = target
+            exact: AgentAddress | None = None
+        elif isinstance(target, AgentAddress):
+            pattern = None
+            exact = target
+        else:  # pragma: no cover — Message rejects bad targets
+            raise InvalidTargetTypeError(
+                "CAST-SUB target must be an AgentAddress or AddressPattern"
+            )
+
+        def predicate(msg: Message) -> bool:
+            if not Code.matches(msg.code, code_glob):
+                return False
+            if exact is not None:
+                if isinstance(msg.target, AgentAddress) and msg.target == exact:
+                    return True
+                return False
+            assert pattern is not None
+            # Match against the concrete target if there is one; otherwise
+            # match the source (so we observe broadcasts emitted *by* agents
+            # in the pattern, since broadcast targets carry no concrete
+            # destination).
+            if isinstance(msg.target, AgentAddress):
+                return pattern.matches(msg.target)
+            return pattern.matches(msg.source)
+
+        return await self.bus.tap_subscribe(predicate=predicate)
 
     async def _handle_invalidate(self, message: Message) -> int:
         if not isinstance(message.target, AddressPattern):

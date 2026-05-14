@@ -7,6 +7,8 @@ streams, but the same struct could ride any transport.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -48,6 +50,26 @@ def _utcnow() -> datetime:
 
 def _new_id() -> str:
     return str(uuid.uuid4())
+
+
+def body_digest(body: Any) -> str:
+    """Stable hex digest of a message body for cache-key derivation.
+
+    ``None`` and missing bodies hash to the empty string so that two
+    requests with no body share a key. Bytes hash directly. Anything else
+    is JSON-encoded with ``sort_keys=True``; non-JSON-serializable values
+    fall back to ``repr()`` (best-effort — caller-defined types should
+    implement ``__repr__`` deterministically if they want stable keys).
+    """
+    if body is None:
+        return ""
+    if isinstance(body, (bytes, bytearray)):
+        return hashlib.sha256(bytes(body)).hexdigest()
+    try:
+        encoded = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    except TypeError:
+        encoded = repr(body)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -118,6 +140,30 @@ class Message:
     @property
     def is_broadcast(self) -> bool:
         return isinstance(self.target, AddressPattern)
+
+    def cache_key(self) -> str:
+        """SHA-256 cache key over (target address, code, body).
+
+        Only valid for point-to-point requests — broadcast targets aren't
+        cached. The body digest makes distinct queries to the same
+        ``(target, code)`` collide-free, while same-body retries reuse
+        the cached response.
+        """
+        if not isinstance(self.target, AgentAddress):
+            raise ValueError(
+                "cache keys require a concrete AgentAddress target, "
+                "not an AddressPattern"
+            )
+        canonical = json.dumps(
+            {
+                "addr": str(self.target),
+                "code": self.code,
+                "body": body_digest(self.body),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     @property
     def expects_response(self) -> bool:

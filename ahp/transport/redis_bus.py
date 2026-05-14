@@ -47,12 +47,28 @@ def _decode_payload(raw: Any) -> Message:
     return Message.from_dict(json.loads(raw))
 
 
-class Subscription:
-    """An active pub/sub subscription. Use as an async context manager."""
+MessagePredicate = Callable[[Message], bool]
+"""Filter callable applied to each inbound Message inside a Subscription."""
 
-    def __init__(self, pubsub: Any, channels: tuple[str, ...]) -> None:
+
+class Subscription:
+    """An active pub/sub subscription. Use as an async context manager.
+
+    A ``predicate`` may be supplied to drop messages that don't match —
+    useful for tap subscriptions where the channel carries every message
+    on the bus and the subscriber only wants a slice.
+    """
+
+    def __init__(
+        self,
+        pubsub: Any,
+        channels: tuple[str, ...],
+        *,
+        predicate: MessagePredicate | None = None,
+    ) -> None:
         self._pubsub = pubsub
         self._channels = channels
+        self._predicate = predicate
         self._closed = False
 
     async def __aenter__(self) -> "Subscription":
@@ -62,15 +78,30 @@ class Subscription:
         await self.close()
 
     async def get_one(self, timeout: float | None = None) -> Message | None:
-        """Wait up to ``timeout`` seconds for a single message."""
+        """Wait up to ``timeout`` seconds for a single message that passes the predicate."""
         if self._closed:
             return None
-        raw = await self._pubsub.get_message(
-            timeout=timeout, ignore_subscribe_messages=True
+        loop_deadline = (
+            asyncio.get_event_loop().time() + timeout
+            if timeout is not None
+            else None
         )
-        if raw is None or raw.get("type") != "message":
-            return None
-        return _decode_payload(raw["data"])
+        while True:
+            remaining = (
+                None
+                if loop_deadline is None
+                else max(0.0, loop_deadline - asyncio.get_event_loop().time())
+            )
+            raw = await self._pubsub.get_message(
+                timeout=remaining, ignore_subscribe_messages=True
+            )
+            if raw is None or raw.get("type") != "message":
+                return None
+            msg = _decode_payload(raw["data"])
+            if self._predicate is None or self._predicate(msg):
+                return msg
+            if loop_deadline is not None and asyncio.get_event_loop().time() >= loop_deadline:
+                return None
 
     async def messages(
         self,
@@ -86,7 +117,9 @@ class Subscription:
                 continue
             if raw.get("type") != "message":
                 continue
-            yield _decode_payload(raw["data"])
+            msg = _decode_payload(raw["data"])
+            if self._predicate is None or self._predicate(msg):
+                yield msg
 
     async def close(self) -> None:
         if self._closed:
@@ -211,7 +244,7 @@ class RedisBus:
                 f"original message {original.message_id} has no reply_to channel"
             )
         await self.append_thread(response)
-        return await self._redis.publish(original.reply_to, _encode(response))
+        return await self._publish(original.reply_to, response)
 
     # ── subscriptions ───────────────────────────────────────────────────
 
@@ -257,7 +290,31 @@ class RedisBus:
     # ── internals ───────────────────────────────────────────────────────
 
     async def _publish(self, channel: str, message: Message) -> int:
-        return await self._redis.publish(channel, _encode(message))
+        payload = _encode(message)
+        delivered = await self._redis.publish(channel, payload)
+        # Mirror to the tap channel so CAST-SUB subscribers see every message
+        # without coupling to per-agent channels. Tap is best-effort — failures
+        # never break primary delivery.
+        with contextlib.suppress(Exception):
+            await self._redis.publish(Keys.tap_channel(), payload)
+        return delivered
+
+    async def tap_subscribe(
+        self,
+        *,
+        predicate: MessagePredicate | None = None,
+    ) -> Subscription:
+        """Subscribe to the tap channel — every message ever published.
+
+        Pass ``predicate`` to filter the stream client-side. The engine's
+        CAST-SUB handler builds a predicate from the verb's pattern target
+        and code glob.
+        """
+        channel = Keys.tap_channel()
+        pubsub = self._redis.pubsub()
+        await pubsub.subscribe(channel)
+        await pubsub.get_message(timeout=0.05, ignore_subscribe_messages=True)
+        return Subscription(pubsub, (channel,), predicate=predicate)
 
     async def _collect_replies(
         self,

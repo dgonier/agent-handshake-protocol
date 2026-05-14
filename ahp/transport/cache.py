@@ -51,14 +51,13 @@ class ProtocolCache:
 
     @staticmethod
     def derive_key(request: Message) -> str:
-        """Cache key digest for a request. Stable across runs."""
-        target = request.target
-        if not isinstance(target, AgentAddress):
-            raise ValueError(
-                "cache keys require a concrete AgentAddress target, "
-                "not an AddressPattern (broadcast requests are not cached)"
-            )
-        return target.cache_key(request.code)
+        """Cache key digest for a request. Stable across runs.
+
+        Combines the target address, the interaction code, and a digest
+        of the request body — so two queries to the same ``(target,
+        code)`` with different bodies don't collide on a cache slot.
+        """
+        return request.cache_key()
 
     @classmethod
     def ttl_for(cls, target: AgentAddress) -> int:
