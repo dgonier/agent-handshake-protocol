@@ -30,7 +30,17 @@ from ahp.adapters.base import AHPAgent
 from ahp.core import AgentAddress
 from ahp.core.codes import Code
 from ahp.core.message import Message
+from ahp.registry import Principal
 from shared import BEAR_URI, BULL_URI, build_stack    # noqa: E402
+
+
+# Node A's identity on the network. The auth policy only lets us
+# register agents whose address matches one of these claim patterns.
+# In a real deployment these claims would arrive as a signed token.
+NODE_A_PRINCIPAL = Principal.with_claims(
+    "node-a",
+    "tifin.adversarial.finance.*.*.*.*",   # bull + bear live here
+)
 
 
 class _BullAgent(AHPAgent):
@@ -63,7 +73,9 @@ class _BearAgent(AHPAgent):
         )
 
 
-client, bus, registry, cache, engine, factory = build_stack()
+client, bus, registry, cache, engine, factory = build_stack(
+    principal=NODE_A_PRINCIPAL,
+)
 bull = _BullAgent(AgentAddress.parse(BULL_URI), engine, heartbeat_interval=0)
 bear = _BearAgent(AgentAddress.parse(BEAR_URI), engine, heartbeat_interval=0)
 

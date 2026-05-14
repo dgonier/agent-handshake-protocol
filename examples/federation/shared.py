@@ -15,7 +15,11 @@ import redis.asyncio as aioredis
 from ahp.adapters import AgentFactory, GroupRegistry, HumanAgent
 from ahp.core import AgentAddress
 from ahp.engine import ProtocolEngine
-from ahp.registry import AgentRegistry
+from ahp.registry import (
+    AddressClaimPolicy,
+    AgentRegistry,
+    Principal,
+)
 from ahp.transport import ProtocolCache, RedisBus
 
 
@@ -31,15 +35,30 @@ BEAR_URI       = "tifin.adversarial.finance.equities.s.session.bear"
 HUMAN_URI      = "public.human.general.http.s.session.devin"
 
 
-def build_stack(redis_url: str = REDIS_URL):
+def build_stack(
+    redis_url: str = REDIS_URL,
+    *,
+    principal: Principal | None = None,
+):
     """Construct (client, bus, registry, cache, engine, factory) for one node.
 
     Both nodes call this with the same ``redis_url`` — they then share
     the registry, bus, cache, threads, and tap channel.
+
+    When ``principal`` is supplied, an :class:`AddressClaimPolicy` is
+    attached to the registry: this node can only register at addresses
+    its principal's claims cover. Leave ``principal=None`` for the
+    open default (any process can register anywhere — fine for
+    single-tenant demos, NOT for multi-tenant production).
     """
     client = aioredis.from_url(redis_url, decode_responses=True)
     bus = RedisBus(client)
-    registry = AgentRegistry(client, heartbeat_ttl=60)
+    registry = AgentRegistry(
+        client,
+        heartbeat_ttl=60,
+        principal=principal,
+        policy=AddressClaimPolicy() if principal is not None else None,
+    )
     cache = ProtocolCache(client)
     engine = ProtocolEngine(bus, registry, cache, default_timeout=30.0)
 

@@ -130,12 +130,46 @@ app = build_app(factory, agents=[my_agent], ...)
 
 Same `AHP_REDIS_URL`. New port. That's it.
 
+## Auth wiring
+
+This demo now uses `AddressClaimPolicy` to gate registration per node.
+Each node builds a `Principal` with the address patterns it's allowed
+to claim:
+
+```python
+# node_a.py
+NODE_A_PRINCIPAL = Principal.with_claims(
+    "node-a",
+    "tifin.adversarial.finance.*.*.*.*",   # bull + bear live here
+)
+
+# node_b.py
+NODE_B_PRINCIPAL = Principal.with_claims(
+    "node-b",
+    "tifin.collaborative.finance.*.*.*.*", # researcher
+    "public.human.*.*.*.*.*",              # HTTP-origin humans
+)
+```
+
+If node_b's startup tried to register `bull` (an adversarial address
+covered only by node_a's claims), the registry would raise
+`UnauthorizedRegistrationError` before writing to Redis. Reads are
+NOT gated — node_b can still resolve `*.adversarial.finance.*.s.*.*`
+and address node_a's agents over the wire.
+
+In production those `with_claims(...)` arguments would come from a
+verified token (JWT subject, mTLS cert claims, etc.). The library is
+agnostic about the verification mechanism; it consumes the parsed
+claims list.
+
 ## What's deliberately NOT here
 
-* **Auth.** Anyone with Redis access can register at any address. For
-  multi-tenant deployments add a control plane that gates `register()`
-  (and validates the `org` field of incoming addresses against signed
-  tokens).
+* **Read-side auth.** `resolve()`, `discover()`, `is_alive()`, and the
+  tap channel remain open. Federation requires every node to see who's
+  on the network. Wrap the registry yourself if you need read gating.
+* **Signature verification.** `Principal.with_claims(...)` here takes
+  raw strings. Wrap it with whatever auth provider you use so the
+  process can only construct a `Principal` it actually owns.
 * **Replication / HA.** A single Redis is a single point of failure;
   use Redis Sentinel or Cluster in production.
 * **Persistent threads beyond Redis stream limits.** The bus's xadd

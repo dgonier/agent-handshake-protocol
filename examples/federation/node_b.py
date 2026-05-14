@@ -26,9 +26,21 @@ from ahp.adapters.base import AHPAgent
 from ahp.core import AgentAddress, AddressPattern
 from ahp.core.codes import Code
 from ahp.core.message import Message
+from ahp.registry import Principal
 from shared import (    # noqa: E402
     ALICE_URI, BEAR_URI, BULL_URI, HUMAN_URI, RESEARCHER_URI,
     build_stack,
+)
+
+
+# Node B's identity. Claims cover collaborative + human addresses
+# but NOT the adversarial ones — so if node_b tried to register
+# bull or bear (which legitimately belong to node_a), the registry
+# would raise UnauthorizedRegistrationError.
+NODE_B_PRINCIPAL = Principal.with_claims(
+    "node-b",
+    "tifin.collaborative.finance.*.*.*.*",   # researcher
+    "public.human.*.*.*.*.*",                # HTTP-origin humans
 )
 
 
@@ -70,7 +82,9 @@ class _Researcher(AHPAgent):
         )
 
 
-client, bus, registry, cache, engine, factory = build_stack()
+client, bus, registry, cache, engine, factory = build_stack(
+    principal=NODE_B_PRINCIPAL,
+)
 researcher = _Researcher(
     AgentAddress.parse(RESEARCHER_URI), engine, heartbeat_interval=0,
 )

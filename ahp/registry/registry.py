@@ -21,6 +21,12 @@ from typing import Any, AsyncIterator
 
 from ahp.core.address import AgentAddress
 from ahp.core.pattern import AddressPattern
+from ahp.registry.auth import (
+    AuthPolicy,
+    OpenAuthPolicy,
+    Principal,
+    UnauthorizedRegistrationError,
+)
 from ahp.transport.keys import Keys
 
 
@@ -59,11 +65,26 @@ class AgentRegistry:
         redis_client: Any,
         *,
         heartbeat_ttl: int = DEFAULT_HEARTBEAT_TTL,
+        principal: Principal | None = None,
+        policy: AuthPolicy | None = None,
     ) -> None:
         if heartbeat_ttl <= 0:
             raise ValueError(f"heartbeat_ttl must be positive, got {heartbeat_ttl}")
         self._redis = redis_client
         self._heartbeat_ttl = heartbeat_ttl
+        # Auth: default policy is permissive (open). Wire a concrete
+        # AddressClaimPolicy + Principal to restrict who may register
+        # which addresses; see ahp.registry.auth.
+        self._principal = principal
+        self._policy: AuthPolicy = policy or OpenAuthPolicy()
+
+    @property
+    def principal(self) -> Principal | None:
+        return self._principal
+
+    @property
+    def policy(self) -> AuthPolicy:
+        return self._policy
 
     @property
     def heartbeat_ttl(self) -> int:
@@ -76,7 +97,17 @@ class AgentRegistry:
         address: AgentAddress,
         metadata: AgentMeta | None = None,
     ) -> None:
-        """Register or update an agent. Also marks it live for ``heartbeat_ttl`` seconds."""
+        """Register or update an agent. Also marks it live for ``heartbeat_ttl`` seconds.
+
+        Consults the active :class:`AuthPolicy`; raises
+        :class:`UnauthorizedRegistrationError` if the principal isn't
+        allowed to claim this address.
+        """
+        if not self._policy.can_register(self._principal, address):
+            raise UnauthorizedRegistrationError(
+                f"principal {self._principal.id if self._principal else '<anonymous>'!r} "
+                f"is not authorized to register {address}"
+            )
         meta = metadata or AgentMeta()
         await self._redis.hset(
             Keys.registry_hash(), str(address), meta.to_json()
@@ -84,12 +115,31 @@ class AgentRegistry:
         await self._mark_alive(address)
 
     async def deregister(self, address: AgentAddress) -> None:
-        """Remove an agent and its liveness marker."""
+        """Remove an agent and its liveness marker.
+
+        Consults the active :class:`AuthPolicy`.
+        """
+        if not self._policy.can_deregister(self._principal, address):
+            raise UnauthorizedRegistrationError(
+                f"principal {self._principal.id if self._principal else '<anonymous>'!r} "
+                f"is not authorized to deregister {address}"
+            )
         await self._redis.hdel(Keys.registry_hash(), str(address))
         await self._redis.delete(Keys.alive_key(address))
 
     async def heartbeat(self, address: AgentAddress) -> bool:
-        """Refresh an agent's liveness marker. Returns False if not registered."""
+        """Refresh an agent's liveness marker.
+
+        Returns False if not registered. Raises
+        :class:`UnauthorizedRegistrationError` if the active policy
+        denies the heartbeat — heartbeating extends a registration,
+        which is a privileged op.
+        """
+        if not self._policy.can_heartbeat(self._principal, address):
+            raise UnauthorizedRegistrationError(
+                f"principal {self._principal.id if self._principal else '<anonymous>'!r} "
+                f"is not authorized to heartbeat {address}"
+            )
         exists = await self._redis.hexists(Keys.registry_hash(), str(address))
         if not exists:
             return False

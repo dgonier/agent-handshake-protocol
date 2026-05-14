@@ -823,6 +823,68 @@ engine and they carry different `groups` or `scope` registries, the
 second factory warns via `logging` before overwriting. Re-attaching
 the same registry (idempotent) does not warn.
 
+## Auth — who may register at which addresses
+
+Same "default open, opt in to tighten" pattern as `ScopePolicy`, but
+for *registration* rather than *routing*. By default any process with
+Redis access can `register()` at any address. To restrict, give the
+registry a `Principal` (the identity of the process) and an
+`AddressClaimPolicy`:
+
+```python
+from ahp.registry import (
+    AddressClaimPolicy, AgentRegistry, Principal,
+    UnauthorizedRegistrationError,
+)
+
+# Node A's identity. Claims are AddressPatterns; only addresses
+# matching one of these patterns may be registered by this node.
+node_a = Principal.with_claims(
+    "node-a",
+    "tifin.adversarial.finance.*.*.*.*",
+    "tifin.collaborative.finance.*.*.*.*",
+)
+
+registry = AgentRegistry(
+    redis_client,
+    principal=node_a,
+    policy=AddressClaimPolicy(),
+)
+
+await registry.register(AgentAddress.parse(
+    "tifin.adversarial.finance.equities.s.session.bull",
+))   # OK
+
+await registry.register(AgentAddress.parse(
+    "public.adversarial.finance.equities.s.session.bull",
+))   # raises UnauthorizedRegistrationError — node-a's claims don't
+     # cover the public org
+```
+
+The same gate fires on `deregister()` and `heartbeat()` — owners can
+take down what they put up, but a foreign node can't kick someone
+else's agent off the network.
+
+Available policies:
+
+| Policy | Default? | Behavior |
+|--------|----------|----------|
+| `OpenAuthPolicy` | yes | accepts everything, including anonymous (`Principal=None`) |
+| `AddressClaimPolicy` | — | a principal can mutate iff one of their claims matches the address. Anonymous principals are denied. |
+| `DenyAllPolicy` | — | refuses every mutation. Useful for read-only mirrors. |
+
+Important non-feature: **reads are not gated.** `resolve()`,
+`discover()`, `get()`, `is_alive()` stay open even under
+`AddressClaimPolicy`. A federation node needs to see who's on the
+network to send messages; gating read paths would break that. If you
+want read-side restrictions too, wrap the registry yourself or layer
+a `ScopePolicy` on the engine.
+
+In production this module is *agnostic* about how the principal's
+claims got there — wrap it with whatever verification you prefer
+(signed JWT, OAuth tokens, mTLS client cert subject). The protocol
+just consumes the parsed claim list.
+
 ## Federation — multiple processes, one network
 
 AHP addresses are universal strings. Any process that connects to the
@@ -866,7 +928,7 @@ dead.
 pytest
 ```
 
-377 tests passing + 1 cleanly skipped (live Bedrock smoke). Coverage
+392 tests passing + 1 cleanly skipped (live Bedrock smoke). Coverage
 across the library includes:
 
 * `test_agent_base.py` — register/deregister/start/stop, auto-reply,
@@ -907,7 +969,8 @@ ahp/
 │   ├── redis_bus.py      RedisBus + Subscription
 │   └── cache.py          ProtocolCache + CachedEntry
 ├── registry/
-│   └── registry.py       AgentRegistry + AgentMeta
+│   ├── registry.py       AgentRegistry + AgentMeta
+│   └── auth.py           Principal + AuthPolicy + claim policies
 ├── engine/
 │   ├── router.py         ProtocolEngine (verb dispatcher)
 │   ├── thread_manager.py ThreadManager + Thread
