@@ -823,6 +823,60 @@ engine and they carry different `groups` or `scope` registries, the
 second factory warns via `logging` before overwriting. Re-attaching
 the same registry (idempotent) does not warn.
 
+## CLI — inspect and scaffold
+
+```bash
+python -m ahp <command> [options]
+```
+
+Subcommands:
+
+| Command | What it does |
+|--------|---|
+| `list-tools` | list registered tools (filter by `--for ADDR` and `--tag T`) |
+| `list-resources` | list registered resources (filter by `--for ADDR`) |
+| `list-groups` | list named address-pattern groups |
+| `profile ADDR` | show the resolved AgentProfile for an address — tools, skills, resources, prompt |
+| `template tool` / `template resource` | print a starter module to stdout |
+| `scaffold tool` / `scaffold resource` | write the starter module to a file (`-o PATH`, `--force` to overwrite) |
+
+Tools and resources only appear after their modules are imported, so
+pass `-m DOTTED.PATH` one or more times to import user modules first:
+
+```bash
+python -m ahp list-tools -m my_project.tools -m my_project.db
+python -m ahp profile tifin.adversarial.finance.equities.s.session.bull \
+  -m my_project.tools -m my_project.db
+```
+
+Scaffolding a new DB tool:
+
+```bash
+python -m ahp scaffold tool \
+  --scope tifin --kind db --category crud \
+  --operation update_record \
+  --signature 'table: str, row_id: str, fields: dict' \
+  -o my_project/db_tools.py
+```
+
+Produces:
+
+```python
+"""Tools registered at scope=tifin kind=db role=* category=crud."""
+
+from ahp.adapters import tool
+
+
+@tool('tifin', 'db', '*', 'crud')
+def update_record(table: str, row_id: str, fields: dict):
+    """One-line description."""
+    # TODO: implement
+    raise NotImplementedError
+```
+
+Note the generated tool uses `role='*'` by default — see the
+"Addressable tools" section above for when to narrow it.
+
 ## Auth — who may register at which addresses
 
 Same "default open, opt in to tighten" pattern as `ScopePolicy`, but
@@ -928,7 +982,7 @@ dead.
 pytest
 ```
 
-392 tests passing + 1 cleanly skipped (live Bedrock smoke). Coverage
+407 tests passing + 1 cleanly skipped (live Bedrock smoke). Coverage
 across the library includes:
 
 * `test_agent_base.py` — register/deregister/start/stop, auto-reply,
@@ -996,9 +1050,11 @@ ahp/
 │   └── deep_agent.py     DeepAgent (wraps deepagents.create_deep_agent)
 ├── llm/
 │   └── bedrock.py        ChatBedrockConverse helper + has_aws_credentials()
-└── demo/
-    ├── finance_analysis.py end-to-end pipeline (deterministic stubs)
-    └── finance_react.py    same pipeline, Bedrock-driven Bull + Bear
+├── demo/
+│   ├── finance_analysis.py end-to-end pipeline (deterministic stubs)
+│   └── finance_react.py    same pipeline, Bedrock-driven Bull + Bear
+├── cli.py                  argparse CLI: list-tools / profile / scaffold / ...
+└── __main__.py             `python -m ahp <subcommand>` entry point
 examples/
 ├── fastapi_serve/         FastAPI consumer of the library (NOT in `ahp/`)
 │   ├── server.py          generic build_app(factory, agents=...)
