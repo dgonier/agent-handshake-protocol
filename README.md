@@ -661,10 +661,17 @@ AHP_DEMO_VARIANT=react uvicorn app:app    # Bedrock-driven
 
 ## Access control — `ScopePolicy`
 
-**Default is open.** Out of the box, any source can address any target;
-the protocol is permissive by design so single-tenant deployments stay
-ergonomic. To tighten progressively, attach a `ScopePolicy` and add
-allow rules over address patterns:
+**Default is open** — meaning *no extra restrictions beyond what the
+protocol already enforces*. The normal layers always run:
+
+* The compatibility matrix gates messages whose code requires a tier
+  the target doesn't accept.
+* Liveness markers gate routing to expired agents.
+* Address-pattern matching gates broadcasts.
+
+Adding a `ScopePolicy` layers *additional* address-pattern allow rules
+on top, restricting who can reach whom. The protocol stays open
+unless you add the policy and the rules. Progressive tightening:
 
 ```python
 from ahp.adapters import AgentFactory
@@ -716,6 +723,31 @@ own policy), but because the addresses are universal, every node on
 the network should typically share the same policy or coordinate via
 a central source of truth.
 
+## Network-mapping resolution conflicts
+
+The address-mapping layer is unambiguous *by address* — every tool /
+resource has a unique full address. But agent profiles surface tools
+to LangChain by their short `operation` name and resources by their
+short `name` field. Two bindings with different addresses that share
+a short name applied to the same agent would silently clobber each
+other in the profile. To prevent that, the factory raises at
+profile-build time:
+
+* `ToolNameCollisionError` — two tools at different `ToolAddress`-es
+  share an `operation` name for one agent. The error message names
+  both addresses so you can decide which to rename or which to
+  narrow with `allowed_for=`.
+* `ResourceNameCollisionError` — two resources at different
+  `ResourceAddress`-es share a `name` field for one agent. Same fix
+  shape: rename or tighten `allowed_for`.
+
+Both inherit from `ResolutionConflictError` for catch-all handlers.
+
+Additionally, if you attach two `AgentFactory` instances to the same
+engine and they carry different `groups` or `scope` registries, the
+second factory warns via `logging` before overwriting. Re-attaching
+the same registry (idempotent) does not warn.
+
 ## Federation — multiple processes, one network
 
 AHP addresses are universal strings. Any process that connects to the
@@ -759,7 +791,7 @@ dead.
 pytest
 ```
 
-356 tests passing + 1 cleanly skipped (live Bedrock smoke). Coverage
+365 tests passing + 1 cleanly skipped (live Bedrock smoke). Coverage
 across the library includes:
 
 * `test_agent_base.py` — register/deregister/start/stop, auto-reply,
@@ -819,6 +851,7 @@ ahp/
 │   ├── tool_registry.py  ToolRegistry + @tool decorator
 │   ├── resources.py      ResourceRegistry + @resource decorator
 │   ├── groups.py         GroupRegistry (named pattern aliases)
+│   ├── errors.py         ResolutionConflictError + Tool/Resource collision types
 │   ├── mcp.py            register_mcp_server + register_mcp_tools
 │   ├── react_agent.py    ReactAgent (wraps create_react_agent)
 │   └── deep_agent.py     DeepAgent (wraps deepagents.create_deep_agent)

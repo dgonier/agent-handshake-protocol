@@ -158,6 +158,30 @@ class ToolRegistry:
     def bindings(self) -> Iterable[ToolBinding]:
         return self._bindings.values()
 
+    def bindings_for_address(
+        self,
+        agent_address: AgentAddress,
+        *,
+        tags: Iterable[str] | None = None,
+    ) -> list[ToolBinding]:
+        """Every binding visible to ``agent_address``, filtered by tags.
+
+        Returns the full :class:`ToolBinding` so callers can see the
+        address (useful for collision diagnostics). Use
+        :meth:`for_address` for the plain ``Tool`` list.
+        """
+        tag_set: set[str] | None = None
+        if tags is not None:
+            tag_set = set(tags)
+        out: list[ToolBinding] = []
+        for binding in self._bindings.values():
+            if not binding.allowed_for.matches(agent_address):
+                continue
+            if tag_set is not None and not (tag_set & binding.tags):
+                continue
+            out.append(binding)
+        return out
+
     def for_address(
         self,
         agent_address: AgentAddress,

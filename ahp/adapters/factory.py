@@ -19,6 +19,7 @@ It's useful when:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -36,6 +37,18 @@ from ahp.core.address import AgentAddress
 from ahp.core.pattern import AddressPattern
 from ahp.engine.router import ProtocolEngine
 from ahp.engine.scope import ScopePolicy
+
+
+log = logging.getLogger(__name__)
+
+
+# Re-exported from ahp.adapters.errors so `ahp.adapters` users see these
+# without an extra import path.
+from ahp.adapters.errors import (    # noqa: E402,F401
+    ResolutionConflictError,
+    ResourceNameCollisionError,
+    ToolNameCollisionError,
+)
 
 
 Builder = Callable[[AgentAddress, ProtocolEngine, AgentProfile], AHPAgent]
@@ -94,16 +107,41 @@ class AgentFactory:
     ) -> None:
         self._engine = engine
         self._regs: list[_Registration] = []
-        self._capabilities = capabilities or CapabilityRegistry()
-        self._tools = tools or ToolRegistry()
-        self._resources = resources or ResourceRegistry()
-        self._groups = groups or GroupRegistry()
+        # Use explicit None checks rather than ``x or DefaultFactory()`` —
+        # all the registries define ``__len__`` so an empty user-supplied
+        # instance would be falsy and silently replaced with a fresh one.
+        self._capabilities = (
+            capabilities if capabilities is not None else CapabilityRegistry()
+        )
+        self._tools = tools if tools is not None else ToolRegistry()
+        self._resources = (
+            resources if resources is not None else ResourceRegistry()
+        )
+        self._groups = groups if groups is not None else GroupRegistry()
         self._scope = scope
         # Expose the group registry through the engine so adapters can
         # resolve a group name without needing a factory reference.
+        # Warn loudly when overwriting non-default state — typical in
+        # tests, dangerous in apps that wire two factories on one engine.
+        prior_groups = getattr(engine, "groups", None)
+        if prior_groups is not None and prior_groups is not self._groups:
+            log.warning(
+                "AgentFactory: engine.groups is being overwritten by this "
+                "factory (was %r, now %r). Two factories sharing an engine "
+                "will fight over group resolution.",
+                prior_groups, self._groups,
+            )
         engine.groups = self._groups
         # Same for the (optional) scope policy. None = open default.
         if scope is not None:
+            prior_scope = getattr(engine, "scope", None)
+            if prior_scope is not None and prior_scope is not scope:
+                log.warning(
+                    "AgentFactory: engine.scope is being overwritten by this "
+                    "factory (was %r, now %r). Scope policies don't compose "
+                    "across factories — pick one source of truth.",
+                    prior_scope, scope,
+                )
             engine.scope = scope
 
     @property
@@ -140,15 +178,42 @@ class AgentFactory:
         * Tool-registry tools whose ``allowed_for`` pattern matches.
         * Resource-registry resources whose ``allowed_for`` pattern
           matches (lazily constructed on first access).
+
+        Raises :class:`ToolNameCollisionError` when two tools at
+        different :class:`ToolAddress`-es share an operation name
+        (LangChain can't disambiguate) and
+        :class:`ResourceNameCollisionError` when two resources share
+        a name (the profile dict would silently overwrite).
         """
         addr = (
             address if isinstance(address, AgentAddress)
             else AgentAddress.parse(address)
         )
         base = self._capabilities.resolve(addr)
-        extra_tools = self._tools.for_address(addr)
-        if extra_tools:
-            base.tools = tuple(base.tools) + tuple(extra_tools)
+
+        # ── tool-registry contribution + collision detection ──────────
+        registry_bindings = self._tools.bindings_for_address(addr)
+        merged_tools = list(base.tools)
+        # Track the source (ToolAddress or "inline capability") of each
+        # short name so error messages are concrete.
+        provenance: dict[str, str] = {
+            t.name: "inline capability provider" for t in base.tools
+        }
+        for binding in registry_bindings:
+            short = binding.tool.name
+            if short in provenance and provenance[short] != str(binding.address):
+                raise ToolNameCollisionError(
+                    f"two tools claim the short name {short!r} for agent "
+                    f"{addr}: {provenance[short]} and {binding.address}. "
+                    f"Rename one or tighten its allowed_for so they don't "
+                    f"both apply to this agent."
+                )
+            if short not in provenance:
+                provenance[short] = str(binding.address)
+                merged_tools.append(binding.tool)
+        base.tools = tuple(merged_tools)
+
+        # ── resource-registry contribution (collisions raised inside) ──
         base.resources = self._resources.for_address(addr)
         return base
 

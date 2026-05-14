@@ -178,15 +178,32 @@ class ResourceRegistry:
     def for_address(self, agent_address: AgentAddress) -> dict[str, Any]:
         """Resources visible to ``agent_address`` as ``{name: instance}``.
 
-        The key is the resource's ``name`` field (the final dot
-        segment). If two resources share a name, the second overwrites
-        the first — keep names unique within a deployment, or use the
-        full address as the lookup key.
+        The dict key is the resource's ``name`` field (the final dot
+        segment of the :class:`ResourceAddress`). Two resources at
+        different full addresses that share the same ``name`` would
+        otherwise silently clobber each other in the agent's profile;
+        this method raises :class:`ResourceNameCollisionError`
+        instead, so the failure surfaces at wiring time. Either
+        rename one resource or tighten its ``allowed_for`` so they
+        don't both apply to the same agent.
         """
+        from ahp.adapters.errors import ResourceNameCollisionError
+
         out: dict[str, Any] = {}
+        provenance: dict[str, ResourceAddress] = {}
         for binding in self._bindings.values():
-            if binding.allowed_for.matches(agent_address):
-                out[binding.address.name] = self.get(str(binding.address))
+            if not binding.allowed_for.matches(agent_address):
+                continue
+            name = binding.address.name
+            if name in provenance and provenance[name] != binding.address:
+                raise ResourceNameCollisionError(
+                    f"two resources claim the short name {name!r} for agent "
+                    f"{agent_address}: {provenance[name]} and "
+                    f"{binding.address}. Rename one or tighten its "
+                    f"allowed_for so they don't both apply to this agent."
+                )
+            provenance[name] = binding.address
+            out[name] = self.get(str(binding.address))
         return out
 
     # ── lifecycle ──────────────────────────────────────────────────────

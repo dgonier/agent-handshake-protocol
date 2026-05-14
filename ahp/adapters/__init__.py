@@ -29,7 +29,14 @@ from ahp.adapters.capability import (
     Skill,
     Tool,
 )
-from ahp.adapters.factory import AgentFactory, Builder, SpawnResult
+from ahp.adapters.factory import (
+    AgentFactory,
+    Builder,
+    ResolutionConflictError,
+    ResourceNameCollisionError,
+    SpawnResult,
+    ToolNameCollisionError,
+)
 from ahp.adapters.groups import (
     DEFAULT_GROUP_REGISTRY,
     Group,
@@ -76,14 +83,17 @@ __all__ = [
     "ProvisioningField",
     "ProvisioningPattern",
     "RagSource",
+    "ResolutionConflictError",
     "ResourceAddress",
     "ResourceBinding",
+    "ResourceNameCollisionError",
     "ResourceRegistry",
     "Skill",
     "SpawnResult",
     "Tool",
     "ToolAddress",
     "ToolBinding",
+    "ToolNameCollisionError",
     "ToolRegistry",
     "default_namer",
     "group",
