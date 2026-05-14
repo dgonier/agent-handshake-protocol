@@ -3,24 +3,32 @@
 Every tool has a structured 5-field :class:`ToolAddress` that drives
 discovery and access control. Tools are usually declared via the
 :meth:`ToolRegistry.tool` decorator, which infers the ``operation``
-field from the decorated function's name::
+field from the decorated function's name.
+
+**Use ``*`` liberally**: the role field describes which agent
+*kinds* may use the tool, not which kinds the tool belongs to. Most
+DB / FS / API tools are usable by any role in scope, so ``role="*"``
+is the right default::
 
     from ahp.adapters import DEFAULT_TOOL_REGISTRY, tool
 
-    @tool("tifin", "db", "adversarial", "crud")
+    @tool("tifin", "db", "*", "crud")           # any tifin role
     def update_record(table: str, row_id: str, fields: dict) -> dict:
         \"\"\"Update a row in the table.\"\"\"
         ...
 
-    # → registered as ToolAddress("tifin", "db", "adversarial", "crud",
+    # → registered as ToolAddress("tifin", "db", "*", "crud",
     #                              "update_record")
-    # → default allowed_for: agents matching "tifin.adversarial.*.*.*.*.*"
+    # → default allowed_for: agents matching "tifin.*.*.*.*.*.*"
 
-Override the default access scope via ``allowed_for=``::
+Only narrow the role when the tool is semantically tied to one kind
+of agent (e.g. a ``redteam`` capability that should only appear in
+adversarial agents' profiles). Override the default access scope via
+``allowed_for=``::
 
     @tool("tifin", "db", "*", "crud",
           allowed_for="*.adversarial.finance.*.*.*.*")
-    def fetch(...): ...
+    def red_team_dump(...): ...
 
 The factory pulls every matching tool into the agent's profile at
 build time.

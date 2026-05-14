@@ -375,21 +375,38 @@ Tools are first-class citizens with their own 5-field address:
 
 Register declaratively with the `@tool` decorator — the operation
 defaults to the function's name, and access scope is derived from the
-address (a tool with `scope=tifin, role=adversarial` is auto-visible
-to any `tifin.adversarial.*.*.*.*.*` agent):
+address. **Use `*` liberally**: the role field describes which agent
+*kinds* may use the tool, not which kinds the tool *belongs to*. Most
+DB / FS / API tools are usable by any role in scope, so `role="*"`
+is the right default:
 
 ```python
 from ahp.adapters import tool
 
-@tool("tifin", "db", "adversarial", "crud")
+@tool("tifin", "db", "*", "crud")            # any tifin role
 def update_record(table: str, row_id: str, fields: dict) -> dict:
     """Update a row in the table."""
     return run_sql(...)
 
-# → registered at ToolAddress("tifin", "db", "adversarial", "crud",
+# → registered at ToolAddress("tifin", "db", "*", "crud",
 #                              "update_record")
-# → default allowed_for: agents matching "tifin.adversarial.*.*.*.*.*"
+# → default allowed_for: agents matching "tifin.*.*.*.*.*.*"
+#   (the convention projects tool.scope/role onto agent org/role; `*`
+#   on role means "any role in the tifin org")
 ```
+
+When to be concrete vs `*`:
+
+* **`scope`** — concrete when the tool is org-private; `"*"` for
+  platform-wide utilities.
+* **`kind`** — concrete (`db`, `fs`, `api`, `compute`). This labels
+  the tool's *type*, not its access.
+* **`role`** — `*` by default. Only constrain when the tool is
+  semantically tied to one role (e.g. a `redteam` tool that should
+  only appear in adversarial agents' profiles).
+* **`category`** — concrete (`crud`, `search`, `read`, `write`).
+  Like `kind`, this is descriptive metadata, not access control.
+* **`operation`** — derived from `func.__name__`.
 
 Override the convention with explicit `allowed_for=` or tag tools for
 selective inclusion (`tags=["read-only", "slow"]`, then

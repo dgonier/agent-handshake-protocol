@@ -14,6 +14,14 @@ into an :class:`AddressPattern` over agent addresses, encoding the
 default convention: a tool's ``scope`` must match the agent's ``org``
 and its ``role`` must match the agent's ``role`` (other fields don't
 gate access).
+
+**Use ``*`` liberally on registration.** Most tools — especially DB,
+FS, and API utilities — are shareable across roles within a scope.
+``role="*"`` lets every role in the scope use the tool; narrow it
+only when the tool is semantically tied to a specific kind of agent
+(e.g. an adversarial-only red-team probe). The same applies to
+``scope="*"`` for tools that should be reachable from any
+organization.
 """
 
 from __future__ import annotations
