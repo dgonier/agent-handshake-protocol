@@ -836,6 +836,7 @@ Subcommands:
 | `list-tools` | list registered tools (filter by `--for ADDR` and `--tag T`) |
 | `list-resources` | list registered resources (filter by `--for ADDR`) |
 | `list-groups` | list named address-pattern groups |
+| `list-agents` | query a live Redis registry; alive by default, `--all` to include stale entries, `--pattern PAT` to filter |
 | `profile ADDR` | show the resolved AgentProfile for an address — tools, skills, resources, prompt |
 | `template tool` / `template resource` | print a starter module to stdout |
 | `scaffold tool` / `scaffold resource` | write the starter module to a file (`-o PATH`, `--force` to overwrite) |
@@ -876,6 +877,23 @@ def update_record(table: str, row_id: str, fields: dict):
 
 Note the generated tool uses `role='*'` by default — see the
 "Addressable tools" section above for when to narrow it.
+
+Querying a live AHP network:
+
+```bash
+# What's actually registered on this Redis right now?
+AHP_REDIS_URL=redis://localhost:6379/0 python -m ahp list-agents
+
+# Only the adversarial finance pool:
+python -m ahp list-agents --pattern '*.adversarial.finance.*.s.*.*'
+
+# Include stale entries (registry hash entry exists but liveness expired):
+python -m ahp list-agents --all
+```
+
+`list-agents` is the only CLI command that does live I/O — the others
+inspect in-process registries. Output columns: address, status
+(`alive`/`stale`), capabilities, reputation, description.
 
 ## Auth — who may register at which addresses
 
@@ -982,7 +1000,7 @@ dead.
 pytest
 ```
 
-407 tests passing + 1 cleanly skipped (live Bedrock smoke). Coverage
+412 tests passing + 1 cleanly skipped (live Bedrock smoke). Coverage
 across the library includes:
 
 * `test_agent_base.py` — register/deregister/start/stop, auto-reply,

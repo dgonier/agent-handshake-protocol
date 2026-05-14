@@ -246,3 +246,135 @@ def test_scaffold_force_overwrites(tmp_path: Path):
     )
     assert rc == 0
     assert "stale" not in target.read_text()
+
+
+# ── list-agents (live Redis via fakeredis) ────────────────────────────
+#
+# list-agents is the only CLI command that does real async I/O. The
+# sync entry point (cmd_list_agents) calls asyncio.run(), which can't
+# run inside pytest-asyncio's already-running loop — so we invoke the
+# async worker directly with an already-parsed args namespace.
+
+
+async def _arun(*argv: str) -> tuple[int, str]:
+    import ahp.cli
+    parser = ahp.cli.build_parser()
+    args = parser.parse_args(list(argv))
+    buf = io.StringIO()
+    rc = await ahp.cli._list_agents_async(args, buf)
+    return rc, buf.getvalue()
+
+
+async def test_list_agents_empty_registry(redis_client, monkeypatch):
+    import ahp.cli
+    monkeypatch.setattr(ahp.cli, "_connect_redis", lambda url: redis_client)
+    rc, out = await _arun("list-agents", "--redis-url", "redis://test/0")
+    assert rc == 0
+    assert "registry is empty" in out
+
+
+async def test_list_agents_lists_alive_agents(redis_client, monkeypatch):
+    """A populated registry shows up in list-agents output."""
+    import ahp.cli
+    from ahp.core.address import AgentAddress
+    from ahp.registry import AgentMeta, AgentRegistry
+
+    monkeypatch.setattr(ahp.cli, "_connect_redis", lambda url: redis_client)
+
+    registry = AgentRegistry(redis_client, heartbeat_ttl=60)
+    await registry.register(
+        AgentAddress.parse("tifin.adversarial.finance.equities.s.session.bull"),
+        AgentMeta(capabilities=["debate", "valuation"], reputation=0.85,
+                  description="bull-case agent"),
+    )
+    await registry.register(
+        AgentAddress.parse("tifin.adversarial.finance.equities.s.session.bear"),
+        AgentMeta(capabilities=["debate", "risk"], reputation=0.80,
+                  description="bear-case agent"),
+    )
+
+    rc, out = await _arun("list-agents", "--redis-url", "redis://test/0")
+    assert rc == 0
+    assert "tifin.adversarial.finance.equities.s.session.bull" in out
+    assert "tifin.adversarial.finance.equities.s.session.bear" in out
+    assert "alive" in out
+    assert "0.85" in out
+    assert "bull-case agent" in out
+
+
+async def test_list_agents_filters_by_pattern(redis_client, monkeypatch):
+    import ahp.cli
+    from ahp.core.address import AgentAddress
+    from ahp.registry import AgentRegistry
+
+    monkeypatch.setattr(ahp.cli, "_connect_redis", lambda url: redis_client)
+
+    registry = AgentRegistry(redis_client, heartbeat_ttl=60)
+    await registry.register(
+        AgentAddress.parse("tifin.adversarial.finance.equities.s.session.bull"),
+    )
+    await registry.register(
+        AgentAddress.parse("tifin.collaborative.finance.equities.s.session.alice"),
+    )
+
+    rc, out = await _arun(
+        "list-agents",
+        "--redis-url", "redis://test/0",
+        "--pattern", "*.adversarial.*.*.*.*.*",
+    )
+    assert rc == 0
+    assert "bull" in out
+    assert "alice" not in out
+    assert "no matching agents" not in out
+
+
+async def test_list_agents_no_matches_under_pattern(redis_client, monkeypatch):
+    import ahp.cli
+    from ahp.core.address import AgentAddress
+    from ahp.registry import AgentRegistry
+
+    monkeypatch.setattr(ahp.cli, "_connect_redis", lambda url: redis_client)
+
+    registry = AgentRegistry(redis_client, heartbeat_ttl=60)
+    await registry.register(
+        AgentAddress.parse("tifin.adversarial.finance.equities.s.session.bull"),
+    )
+
+    rc, out = await _arun(
+        "list-agents",
+        "--redis-url", "redis://test/0",
+        "--pattern", "nobody.*.*.*.*.*.*",
+    )
+    assert rc == 0
+    assert "no matching agents" in out
+
+
+async def test_list_agents_all_includes_stale(redis_client, monkeypatch):
+    """--all surfaces registry entries whose liveness has expired."""
+    import ahp.cli
+    from ahp.core.address import AgentAddress
+    from ahp.registry import AgentRegistry
+    from ahp.transport.keys import Keys
+
+    monkeypatch.setattr(ahp.cli, "_connect_redis", lambda url: redis_client)
+
+    registry = AgentRegistry(redis_client, heartbeat_ttl=60)
+    addr = AgentAddress.parse(
+        "tifin.adversarial.finance.equities.s.session.zombie",
+    )
+    await registry.register(addr)
+    # Kill the liveness marker — the registry hash entry remains.
+    await redis_client.delete(Keys.alive_key(addr))
+
+    # Default (alive_only): nothing.
+    rc, out = await _arun("list-agents", "--redis-url", "redis://test/0")
+    assert rc == 0
+    assert "zombie" not in out
+
+    # --all: shows up with status=stale.
+    rc, out = await _arun(
+        "list-agents", "--redis-url", "redis://test/0", "--all",
+    )
+    assert rc == 0
+    assert "zombie" in out
+    assert "stale" in out

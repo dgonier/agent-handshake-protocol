@@ -27,7 +27,9 @@ before the command runs::
 from __future__ import annotations
 
 import argparse
+import asyncio
 import importlib
+import os
 import sys
 import textwrap
 from pathlib import Path
@@ -311,6 +313,70 @@ def _render_table(
         print(fmt.format(*row), file=out)
 
 
+# ── list-agents (live Redis) ─────────────────────────────────────────
+
+
+def _connect_redis(url: str):
+    """Construct an async Redis client. Module-level so tests can swap it.
+
+    Tests that want to use fakeredis monkey-patch this name; the
+    production code path imports redis.asyncio lazily so the library
+    has no hard dep on the redis client unless this command is used.
+    """
+    import redis.asyncio as aioredis
+    return aioredis.from_url(url, decode_responses=True)
+
+
+async def _list_agents_async(args: argparse.Namespace, out: TextIO) -> int:
+    """The actual async work for the list-agents command."""
+    from ahp.registry import AgentMeta, AgentRegistry
+
+    client = _connect_redis(args.redis_url)
+    registry = AgentRegistry(client)
+    try:
+        pattern = (
+            AddressPattern.parse(args.pattern)
+            if args.pattern else AddressPattern.all()
+        )
+        if args.all:
+            all_addrs = await registry.list_all(alive_only=False)
+            addresses = [a for a in all_addrs if pattern.matches(a)]
+        else:
+            addresses = await registry.resolve(pattern, alive_only=True)
+
+        if not addresses:
+            scope_note = "(no matching agents)" if args.pattern else "(registry is empty)"
+            print(scope_note, file=out)
+            return 0
+
+        rows: list[tuple[str, str, str, str, str]] = []
+        for addr in sorted(addresses, key=str):
+            meta = await registry.get(addr) or AgentMeta()
+            alive = await registry.is_alive(addr)
+            rows.append((
+                str(addr),
+                "alive" if alive else "stale",
+                ",".join(meta.capabilities) or "-",
+                f"{meta.reputation:.2f}",
+                (meta.description or "-")[:60],
+            ))
+        _render_table(
+            out,
+            ["address", "status", "capabilities", "rep", "description"],
+            rows,
+        )
+        return 0
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+
+def cmd_list_agents(args: argparse.Namespace, out: TextIO) -> int:
+    return asyncio.run(_list_agents_async(args, out))
+
+
 # ── argparse setup ────────────────────────────────────────────────────
 
 
@@ -348,6 +414,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_lg = sub.add_parser("list-groups", help="list named address-pattern groups")
     p_lg.add_argument("-m", "--module", action="append", default=[])
     p_lg.set_defaults(func=cmd_list_groups)
+
+    # list-agents (live Redis)
+    p_la = sub.add_parser(
+        "list-agents",
+        help="query a live registry over Redis for currently-registered agents",
+    )
+    default_url = os.environ.get("AHP_REDIS_URL", "redis://localhost:6379/0")
+    p_la.add_argument(
+        "--redis-url",
+        default=default_url,
+        help=f"Redis URL to query (default: {default_url}, "
+             f"or $AHP_REDIS_URL when set)",
+    )
+    p_la.add_argument(
+        "--pattern",
+        help="AddressPattern to filter results (default: every alive agent)",
+    )
+    p_la.add_argument(
+        "--all", action="store_true",
+        help="include registered agents whose liveness marker has expired",
+    )
+    p_la.set_defaults(func=cmd_list_agents)
 
     # profile
     p_pr = sub.add_parser("profile",
