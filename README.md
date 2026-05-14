@@ -659,13 +659,50 @@ uvicorn app:app --reload          # stub variant
 AHP_DEMO_VARIANT=react uvicorn app:app    # Bedrock-driven
 ```
 
+## Federation — multiple processes, one network
+
+AHP addresses are universal strings. Any process that connects to the
+same Redis is a node on the same network: it sees the same registry,
+the same tap, the same cache. There's no "AHP service" daemon —
+peers federate by sharing the substrate.
+
+[`examples/federation/`](examples/federation/) runs two FastAPI
+processes against one Redis to prove this end-to-end:
+
+```
+Node A :8001          Redis           Node B :8002
+─────────────         ──────          ──────────────
+Bull  (...bull) ◀──── HSET ────▶  Researcher (...researcher)
+Bear  (...bear) ◀──── PUBSUB ──▶  (calls A's agents by URI alone)
+                ◀──── XADD ───▶
+```
+
+Node B's researcher broadcasts `CAST-GET` to
+`*.adversarial.finance.*.s.*.*`. The registry resolves that to Bull
+and Bear (hosted on Node A); replies flow back over Redis pub/sub.
+Node B's source code never imports or references Node A.
+
+```bash
+docker run --rm -p 6379:6379 redis:7-alpine                    # the substrate
+cd examples/federation && ./start.sh                            # both nodes
+curl -X POST http://localhost:8002/query \
+  -d '{"target":"tifin.collaborative.finance.equities.s.session.researcher",
+       "body":"Tesla","thread":"t::devin","timeout":30}'
+```
+
+Library-level proof is in `tests/test_federation.py` (5 tests over a
+shared fakeredis): registry sharing, cross-node SEND-GET, cross-node
+CAST-GET that reaches both A and B, group-name resolution that routes
+over the wire, and cache hits served from a node whose agent is now
+dead.
+
 ## Tests
 
 ```bash
 pytest
 ```
 
-339 tests passing + 1 cleanly skipped (live Bedrock smoke). Coverage
+344 tests passing + 1 cleanly skipped (live Bedrock smoke). Coverage
 across the library includes:
 
 * `test_agent_base.py` — register/deregister/start/stop, auto-reply,
@@ -733,10 +770,16 @@ ahp/
     ├── finance_analysis.py end-to-end pipeline (deterministic stubs)
     └── finance_react.py    same pipeline, Bedrock-driven Bull + Bear
 examples/
-└── fastapi_serve/         FastAPI consumer of the library (NOT in `ahp/`)
-    ├── server.py          generic build_app(factory, agents=...)
-    ├── app.py             wires the finance demo behind HTTP
-    ├── requirements.txt
+├── fastapi_serve/         FastAPI consumer of the library (NOT in `ahp/`)
+│   ├── server.py          generic build_app(factory, agents=...)
+│   ├── app.py             wires the finance demo behind HTTP
+│   ├── requirements.txt
+│   └── README.md
+└── federation/            two FastAPI processes, one shared Redis
+    ├── shared.py          build_stack(redis_url) helper
+    ├── node_a.py          Bull + Bear at universal addresses
+    ├── node_b.py          Researcher; reaches A by URI alone
+    ├── start.sh           launch both nodes
     └── README.md
 tests/
     test_address.py  test_pattern.py  test_codes.py  test_message.py

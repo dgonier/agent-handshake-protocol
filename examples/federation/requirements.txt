@@ -1,0 +1,6 @@
+# Federation example dependencies.
+# Install `ahp` itself from the repo root: `pip install -e ../../`
+fastapi>=0.110
+uvicorn[standard]>=0.27
+httpx>=0.27
+redis>=5.0
