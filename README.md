@@ -440,6 +440,64 @@ Agents matching the resource's `allowed_for` pattern get a
 `profile.resources["sec-edgar"]` map handed to their builder — tools
 inside the agent grab the client by name.
 
+## Addressable storage — `kind="fs"` resources
+
+Filesystem-backed resources are just `Resource`s with `kind="fs"`.
+They register at `{scope}.fs.{domain}.{subdomain}.{name}` like
+anything else, and the `DeepAgent` adapter automatically mounts every
+matching one into its virtual filesystem:
+
+```python
+from ahp.adapters import resource
+from ahp.adapters.deep_agent import DeepAgent
+from deepagents.backends import StateBackend
+
+@resource("tifin", "fs", "finance", "documents",
+          name="scratch", description="finance team scratch + uploads")
+def make_scratch_fs():
+    return StateBackend()   # or any BackendProtocol implementation
+
+@resource("tifin", "fs", "finance", "filings",
+          name="filings", description="SEC EDGAR cache")
+def make_filings_fs():
+    return _load_chroma_backed_fs(...)
+
+# In your factory wiring:
+researcher = DeepAgent.from_profile(
+    address, engine, profile, model=bedrock_chat_model(),
+    fs_resources=factory.resources,   # ← that's the whole integration
+)
+```
+
+What the integration does:
+
+1. **Filters by address.** Only fs-kind resources whose `allowed_for`
+   pattern matches the agent end up in its virtual FS — same
+   convention as tools (default: `{scope}/{*}/{domain}/{subdomain}`).
+2. **Mounts each at `/<name>/` by default.** `scratch` mounts at
+   `/scratch/`, `filings` at `/filings/`. Override via the
+   `mount_path=` callable to `build_fs_backend` if you want a
+   different scheme.
+3. **Wraps in `CompositeBackend` when there's more than one.** A
+   single matching backend is returned directly; multiple are
+   composed with the default backend handling the unmatched-prefix
+   case.
+4. **Appends a system-prompt fragment listing every mount** so the
+   LLM knows where to read/write. Format:
+   ```
+   Available filesystem mounts:
+   - /scratch/ — finance team scratch + uploads
+   - /filings/ — SEC EDGAR cache
+   ```
+5. **Mount-path collisions raise** `ValueError` at build time — same
+   philosophy as the other resolution-conflict errors.
+
+Tools that the LLM sees come from deepagents' `FilesystemMiddleware`:
+`ls`, `read_file`, `write_file`, `edit_file`, `glob`, `grep`. Your
+backend implements the deepagents `BackendProtocol` (`StateBackend`
+ships with the library; `LocalShellBackend`, `StoreBackend`,
+`ContextHubBackend` are also available).
+
 ## MCP passthrough
 
 Register an entire MCP server's tool surface under one scope:
@@ -808,7 +866,7 @@ dead.
 pytest
 ```
 
-365 tests passing + 1 cleanly skipped (live Bedrock smoke). Coverage
+377 tests passing + 1 cleanly skipped (live Bedrock smoke). Coverage
 across the library includes:
 
 * `test_agent_base.py` — register/deregister/start/stop, auto-reply,
@@ -869,6 +927,7 @@ ahp/
 │   ├── resources.py      ResourceRegistry + @resource decorator
 │   ├── groups.py         GroupRegistry (named pattern aliases)
 │   ├── errors.py         ResolutionConflictError + Tool/Resource collision types
+│   ├── storage.py        build_fs_backend + fs_mount_description (kind=fs → deepagents)
 │   ├── mcp.py            register_mcp_server + register_mcp_tools
 │   ├── react_agent.py    ReactAgent (wraps create_react_agent)
 │   └── deep_agent.py     DeepAgent (wraps deepagents.create_deep_agent)

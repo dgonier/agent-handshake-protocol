@@ -56,6 +56,13 @@ from ahp.adapters.resources import (
     ResourceRegistry,
     resource,
 )
+from ahp.adapters.storage import (
+    FS_KIND,
+    build_fs_backend,
+    default_mount_path,
+    fs_mount_description,
+    fs_resource_addresses,
+)
 from ahp.adapters.tool_address import ResourceAddress, ToolAddress
 from ahp.adapters.tool_registry import (
     DEFAULT_TOOL_REGISTRY,
@@ -75,6 +82,7 @@ __all__ = [
     "DEFAULT_GROUP_REGISTRY",
     "DEFAULT_RESOURCE_REGISTRY",
     "DEFAULT_TOOL_REGISTRY",
+    "FS_KIND",
     "FieldNamer",
     "Group",
     "GroupRegistry",
@@ -95,7 +103,11 @@ __all__ = [
     "ToolBinding",
     "ToolNameCollisionError",
     "ToolRegistry",
+    "build_fs_backend",
+    "default_mount_path",
     "default_namer",
+    "fs_mount_description",
+    "fs_resource_addresses",
     "group",
     "resource",
     "tool",

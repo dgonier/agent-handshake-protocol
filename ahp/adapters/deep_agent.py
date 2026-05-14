@@ -33,6 +33,8 @@ from ahp.adapters.react_agent import (
     _react_output_mapper_for,
     _to_langchain_tool,
 )
+from ahp.adapters.resources import ResourceRegistry
+from ahp.adapters.storage import build_fs_backend, fs_mount_description
 from ahp.core.address import AgentAddress
 from ahp.engine.router import ProtocolEngine
 from ahp.registry.registry import AgentMeta
@@ -73,8 +75,19 @@ class DeepAgent(LangGraphAgent):
         metadata: AgentMeta | None = None,
         extra_tools: Iterable[Tool] | None = None,
         extra_subagents: Iterable[SubAgent] | None = None,
+        fs_resources: ResourceRegistry | None = None,
         **kwargs: Any,
     ) -> "DeepAgent":
+        """Build a DeepAgent from a profile.
+
+        ``fs_resources`` (optional): a :class:`ResourceRegistry`. Any
+        resource registered with ``kind="fs"`` whose ``allowed_for``
+        matches ``address`` is mounted into the agent's virtual
+        filesystem (default mount path ``/<name>/``). The system prompt
+        is appended with a list of available mounts so the LLM knows
+        where to read/write. Pass ``factory.resources`` for the common
+        case.
+        """
         tools_in: list[Tool] = list(profile.tools)
         if extra_tools:
             tools_in.extend(extra_tools)
@@ -84,11 +97,20 @@ class DeepAgent(LangGraphAgent):
         if extra_subagents:
             subagents.extend(extra_subagents)
 
+        backend = None
+        prompt = profile.prompt or ""
+        if fs_resources is not None:
+            backend = build_fs_backend(fs_resources, address)
+            mount_desc = fs_mount_description(fs_resources, address)
+            if mount_desc:
+                prompt = (prompt + "\n\n" if prompt else "") + mount_desc
+
         graph = create_deep_agent(
             model=model,
             tools=lc_tools,
-            system_prompt=profile.prompt or None,
+            system_prompt=prompt or None,
             subagents=subagents or None,
+            backend=backend,
         )
         return cls(
             address=address,
