@@ -14,10 +14,10 @@ dependencies = []
 
 [project.optional-dependencies]
 redis = ["redis>=5.0"]
-langgraph = ["langgraph>=0.2"]
+langgraph = ["langgraph>=1.0"]
 dspy = ["dspy-ai>=2.4"]
 aws = ["langchain-aws>=0.2", "boto3>=1.34", "python-dotenv>=1.0"]
-deepagents = ["deepagents>=0.1"]
+deepagents = ["deepagents>=0.6"]
 mcp = ["langchain-mcp-adapters>=0.1", "mcp>=1.0"]
 # FastAPI is intentionally NOT a library extra. See examples/fastapi_serve/
 # for a complete FastAPI consumer of this package.
@@ -27,12 +27,13 @@ test = [
     "hypothesis>=6",
     "fakeredis>=2.20",
     "redis>=5.0",
-    "langgraph>=0.2",
+    "langgraph>=1.0",
     "dspy-ai>=2.4",
     "langchain-aws>=0.2",
     "boto3>=1.34",
     "python-dotenv>=1.0",
-    "deepagents>=0.1",
+    "deepagents>=0.6",
+    "langchain>=1.0",
     "langchain-mcp-adapters>=0.1",
     "mcp>=1.0",
 ]

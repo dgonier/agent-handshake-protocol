@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Runs · AHP{% endblock %}
+
+{% block content %}
+<h1>Previous Runs</h1>
+<p class="meta">Most recent debate transcripts, persisted to disk.</p>
+
+{% if not runs %}
+  <p class="empty">No runs persisted yet.</p>
+{% else %}
+  {% for r in runs %}
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; gap: 12px; align-items: baseline;">
+        <div style="font-weight: 600;">
+          <a href="/runs/{{ r.id }}" style="color: var(--accent); text-decoration: none;">{{ r.topic }}</a>
+        </div>
+        <div class="meta" style="margin: 0; white-space: nowrap;">{{ r.when }}</div>
+      </div>
+      <div class="meta" style="margin-top: 4px;">
+        {{ r.subdomain }} · {{ r.count }} agents · {{ r.events }} audit events
+      </div>
+    </div>
+  {% endfor %}
+{% endif %}
+{% endblock %}

@@ -152,7 +152,7 @@ class Inviter:
             f'  ]\n'
             f'}}\n\n'
             f"Constraints: slugs must be unique, lowercase, kebab-case, "
-            f"<= 24 chars. system prompts must not include the topic verbatim; "
+            f"<= 48 chars. system prompts must not include the topic verbatim; "
             f"they describe the *stance*, not the question."
         )
 
@@ -173,7 +173,7 @@ class _ParseError(Exception):
     pass
 
 
-_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
 
 
 def _parse_slate(text: str, *, expected: int) -> list[AgentInvitation]:

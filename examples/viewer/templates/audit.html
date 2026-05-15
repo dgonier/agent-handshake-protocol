@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Audit · AHP{% endblock %}
+
+{% block content %}
+<h1>Audit Stream</h1>
+<p class="meta">
+  Every protocol op from the most recent debate run.
+  {% if result %}
+    {{ result.audit_events|length }} events ·
+    {{ result.topic }}
+  {% endif %}
+</p>
+
+{% if not result %}
+  <p class="empty">No debate run yet. Visit <a href="/" style="color: var(--accent);">Debate</a> to kick one off.</p>
+{% else %}
+  <div class="card scroll-x">
+    <table>
+      <thead>
+        <tr>
+          <th>t (s)</th>
+          <th>op</th>
+          <th>verb</th>
+          <th>code</th>
+          <th>source → target</th>
+          <th>status</th>
+          <th>extra</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% set t0 = result.audit_events[0].timestamp if result.audit_events else 0 %}
+        {% for e in result.audit_events %}
+          <tr>
+            <td class="mono">{{ "%.2f" | format(e.timestamp - t0) }}</td>
+            <td><code>{{ e.op }}</code></td>
+            <td><code>{{ e.verb or "" }}</code></td>
+            <td><code>{{ e.code or "" }}</code></td>
+            <td class="mono">
+              {% if e.source %}{{ e.source.split(".") | last }}{% endif %}
+              {% if e.target %}→ {{ e.target.split(".") | last if e.source else e.target.split(".") | last }}{% endif %}
+            </td>
+            <td>
+              {% if e.success %}
+                <span class="pill ok">ok</span>
+              {% else %}
+                <span class="pill bad">{{ e.error or "fail" }}</span>
+              {% endif %}
+            </td>
+            <td class="mono">{% if e.extra %}{{ e.extra }}{% endif %}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if result.cloudwatch_stream %}
+    <p class="meta" style="margin-top: 12px;">
+      Also streamed live to CloudWatch:
+      group <code>/ahp/astrophysics-demo</code>,
+      stream <code>{{ result.cloudwatch_stream }}</code>.
+    </p>
+  {% endif %}
+{% endif %}
+{% endblock %}

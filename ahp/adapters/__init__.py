@@ -44,6 +44,13 @@ from ahp.adapters.groups import (
     group,
 )
 from ahp.adapters.human import HumanAgent, ObservationLevel
+from ahp.adapters.formats import (
+    FORMATS,
+    Format,
+    FormatNotFoundError,
+    get_format,
+    list_formats,
+)
 from ahp.adapters.inviter import AgentInvitation, ChatModel, Inviter
 from ahp.adapters.prompts import (
     RECIPES,

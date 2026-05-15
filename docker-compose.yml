@@ -1,0 +1,74 @@
+# Local stack for the AHP debate viewer.
+#
+# Two services:
+#   redis   — real Redis backend for the engine + registry + cache.
+#   viewer  — FastAPI mobile-friendly UI for kicking off debates and
+#             reading the audit trail.
+#
+# Run::
+#
+#     docker compose up --build
+#
+# Then from any device on the same LAN: http://<host-ip>:8765
+#
+# Requires AWS credentials reachable by the viewer container. We bind-
+# mount ~/.aws read-only and forward AWS_REGION; that picks up
+# ``aws configure`` on the host without copying secrets into the image.
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  viewer:
+    build:
+      context: .
+      dockerfile: examples/viewer/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: "redis://redis:6379/0"
+      AWS_REGION: "${AWS_REGION:-us-east-1}"
+      BEDROCK_MODEL_ID: "${BEDROCK_MODEL_ID:-us.anthropic.claude-haiku-4-5-20251001-v1:0}"
+      VIEWER_CLOUDWATCH_GROUP: "${VIEWER_CLOUDWATCH_GROUP:-/ahp/astrophysics-demo}"
+      VIEWER_DEFAULT_TOPIC: "${VIEWER_DEFAULT_TOPIC:-What caused the Big Bang?}"
+      VIEWER_DEFAULT_SUBDOMAIN: "${VIEWER_DEFAULT_SUBDOMAIN:-astrophysics}"
+    # 0.0.0.0:8765 so the phone on the same LAN can reach it.
+    ports:
+      - "0.0.0.0:9876:8000"
+    volumes:
+      # AWS credentials picked up via the default boto3 chain.
+      - "${HOME}/.aws:/root/.aws:ro"
+      # Read-only mount of the debaterhub frontend .env so the viewer
+      # can read TAVILY_API_KEY (and any other shared keys) without
+      # duplicating secrets into this repo.
+      - "${HOME}/debaterhub/debaterhub-monorepo/apps/front/.env:/secrets/frontend.env:ro"
+      # Run transcripts persist outside the container.
+      - viewer_data:/data
+
+  # Optional Cloudflare quick-tunnel. Enable with:
+  #
+  #     docker compose --profile tunnel up --build
+  #
+  # The tunnel prints a public https://*.trycloudflare.com URL to the
+  # container logs the first time it starts. Disabled by default so the
+  # viewer stays LAN-only unless you explicitly opt in.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    depends_on:
+      - viewer
+    command: tunnel --no-autoupdate --url http://viewer:8000
+
+volumes:
+  viewer_data:

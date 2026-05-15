@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+{% block title %}{{ result.format if result else "Session" }} · {{ result.topic if result else "no run yet" }}{% endblock %}
+
+{% block content %}
+<h1>Multi-agent Sessions</h1>
+<p class="meta">
+  An SLM picks a panel; agents run a 3-round session in the format you choose.
+  <span class="pill dim" style="margin-left: 6px;">model: {{ model_label }}</span>
+</p>
+
+<form method="POST" action="/run">
+  <label style="flex: 3 1 220px;">
+    Topic
+    <input name="topic" required value="{{ default_topic }}"
+           placeholder="What caused the Big Bang?">
+  </label>
+  <label style="flex: 1 1 160px;">
+    Format
+    <select name="format">
+      {% for f in formats %}
+        <option value="{{ f.name }}"
+          {% if f.name == default_format %}selected{% endif %}>
+          {{ f.name }}
+        </option>
+      {% endfor %}
+    </select>
+  </label>
+  <label style="flex: 1 1 100px;">
+    Company
+    <input name="org" value="{{ default_org }}">
+  </label>
+  <label style="flex: 1 1 100px;">
+    Domain
+    <input name="domain" value="{{ default_domain }}">
+  </label>
+  <label style="flex: 1 1 100px;">
+    Subdomain
+    <input name="subdomain" value="{{ default_subdomain }}">
+  </label>
+  <label style="flex: 0 0 70px;">
+    Count
+    <input name="count" type="number" value="4" min="1" max="6">
+  </label>
+  <button type="submit" {% if running %}disabled{% endif %}>
+    {% if running %}Running…{% else %}Run{% endif %}
+  </button>
+</form>
+
+{% if running %}
+  <p class="meta" style="margin-top: 16px;">
+    <span class="pill dim">in-progress</span>
+    Started {{ running_for }}s ago. Refresh in a moment.
+  </p>
+{% endif %}
+
+{% if error %}
+  <p class="meta" style="margin-top: 12px;">
+    <span class="pill bad">error</span> <code>{{ error }}</code>
+  </p>
+{% endif %}
+
+{% if live_agents %}
+  <h2>Live agents ({{ live_agents|length }})</h2>
+  <p class="meta">Currently alive in the Redis registry.</p>
+  <div class="card scroll-x">
+    <table>
+      <thead>
+        <tr>
+          <th>company</th><th>role</th><th>domain</th><th>subdomain</th>
+          <th>accept</th><th>life</th><th>instance</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for a in live_agents %}
+          <tr>
+            <td><code>{{ a.org }}</code></td>
+            <td><code>{{ a.role }}</code></td>
+            <td><code>{{ a.domain }}</code></td>
+            <td><code>{{ a.subdomain }}</code></td>
+            <td><code>{{ a.accept }}</code></td>
+            <td><code>{{ a.lifecycle }}</code></td>
+            <td><code>{{ a.instance }}</code></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+
+{% if result %}
+  <h2>Topic</h2>
+  <div class="card">
+    <div style="font-size: 17px; font-weight: 500;">{{ result.topic }}</div>
+    <div class="meta" style="margin-top: 6px;">
+      <span class="pill ok" style="margin-right: 6px;">{{ result.format }}</span>
+      {{ result.org }} · {{ result.domain }} / {{ result.subdomain }} ·
+      {{ result.count }} agents ·
+      r1 {{ "%.1f"|format(result.elapsed_round1) }}s
+      {% if result.elapsed_round2 > 0 %}· r2 {{ "%.1f"|format(result.elapsed_round2) }}s{% endif %}
+      {% if result.elapsed_closing > 0 %}· close {{ "%.1f"|format(result.elapsed_closing) }}s{% endif %}
+      · <code>{{ result.model_id.split(".") | last }}</code>
+    </div>
+  </div>
+
+  <h2>Panel ({{ result.personas|length }})</h2>
+  {% for addr, persona in result.personas.items() %}
+    <div class="card">
+      <div class="slug">{{ addr.split(".") | last }}</div>
+      <div class="address">{{ addr }}</div>
+      <div class="persona">{{ persona }}</div>
+    </div>
+  {% endfor %}
+
+  {% macro render_turn(t) %}
+    <div class="card">
+      <div class="slug">{{ t.slug }}</div>
+      <div class="address">{{ t.address }}</div>
+      {% if t.tool_calls %}
+        <div style="margin-top: 8px; font-size: 12px;">
+          {% for tc in t.tool_calls %}
+            <span class="pill" style="background: rgba(247,185,85,0.18); color: var(--accent-warn); margin-right: 4px;">
+              🔧 {{ tc.name }}({% for k, v in tc.args.items() %}{{ k }}={{ v|tojson }}{% if not loop.last %}, {% endif %}{% endfor %})
+            </span>
+          {% endfor %}
+        </div>
+      {% endif %}
+      <div class="body">{{ t.text }}</div>
+    </div>
+  {% endmacro %}
+
+  <h2>Round 1</h2>
+  {% for t in result.round1 %}{{ render_turn(t) }}
+  {% else %}<p class="empty">no replies</p>{% endfor %}
+
+  {% if result.round2 %}
+    <h2>Round 2</h2>
+    {% for t in result.round2 %}{{ render_turn(t) }}{% endfor %}
+  {% endif %}
+
+  {% if result.closing %}
+    <h2>Closing</h2>
+    {% for t in result.closing %}{{ render_turn(t) }}{% endfor %}
+  {% endif %}
+
+  {% if result.cloudwatch_stream %}
+    <p class="meta">
+      CloudWatch log stream: <code>{{ result.cloudwatch_stream }}</code>
+    </p>
+  {% endif %}
+{% elif not running %}
+  <p class="empty">No session run yet — submit the form above.</p>
+{% endif %}
+{% endblock %}
