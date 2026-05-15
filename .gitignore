@@ -13,3 +13,6 @@ htmlcov/
 .ruff_cache/
 *.swp
 .DS_Store
+
+# Throwaway demo / smoke-test scripts. Promote to examples/ if useful.
+scratch/

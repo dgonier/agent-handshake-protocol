@@ -26,6 +26,7 @@ from typing import Callable
 from ahp.adapters.base import AHPAgent
 from ahp.adapters.capability import AgentProfile, CapabilityRegistry
 from ahp.adapters.groups import GroupRegistry
+from ahp.adapters.inviter import AgentInvitation, ChatModel, Inviter
 from ahp.adapters.provisioning import (
     FieldNamer,
     ProvisioningPattern,
@@ -104,9 +105,17 @@ class AgentFactory:
         resources: ResourceRegistry | None = None,
         groups: GroupRegistry | None = None,
         scope: ScopePolicy | None = None,
+        slm: ChatModel | None = None,
     ) -> None:
         self._engine = engine
         self._regs: list[_Registration] = []
+        # Optional SLM used by :meth:`invite` to generate per-query
+        # persona slates. Builders never see this; they read the
+        # resulting persona via :meth:`persona_for`.
+        self._slm = slm
+        self._inviter: Inviter | None = Inviter(slm) if slm is not None else None
+        # Address → persona system prompt, populated by invite().
+        self._personas: dict[str, str] = {}
         # Use explicit None checks rather than ``x or DefaultFactory()`` —
         # all the registries define ``__len__`` so an empty user-supplied
         # instance would be falsy and silently replaced with a fresh one.
@@ -331,3 +340,98 @@ class AgentFactory:
             else ProvisioningPattern.parse(spec)
         )
         return [self.create(addr) for addr in pattern.materialize(namer=namer)]
+
+    # ── SLM-driven invitation ──────────────────────────────────────────
+
+    @property
+    def slm(self) -> ChatModel | None:
+        return self._slm
+
+    def set_slm(self, model: ChatModel) -> None:
+        """Attach an SLM after construction. Rebuilds the inviter."""
+        self._slm = model
+        self._inviter = Inviter(model)
+
+    def persona_for(self, address: AgentAddress) -> str | None:
+        """Return the persona system prompt set by :meth:`invite`, if any."""
+        return self._personas.get(str(address))
+
+    def invitations(self) -> dict[str, str]:
+        """All persona system prompts keyed by address (debug helper)."""
+        return dict(self._personas)
+
+    async def invite(
+        self,
+        *,
+        org: str,
+        role: str,
+        domain: str,
+        subdomain: str,
+        topic: str,
+        count: int,
+        accept: str = "s",
+        lifecycle: str = "session",
+        mode_hint: str | None = None,
+    ) -> SpawnResult:
+        """Use the configured SLM to populate a slate of agents for ``topic``.
+
+        Asks the SLM for ``count`` perspectives a community in
+        ``domain/subdomain`` would hold on ``topic``. Materializes one
+        agent per perspective at::
+
+            {org}.{role}.{domain}.{subdomain}.{accept}.{lifecycle}.{slug}
+
+        The per-agent persona system prompt is stored on the factory
+        and retrievable via :meth:`persona_for`. Builders typically
+        read it during construction (see the live demo).
+
+        Returns the standard :class:`SpawnResult` so callers can
+        ``register()`` / ``start()`` themselves, or use
+        :meth:`invite_and_start` for the one-shot version.
+        """
+        if self._inviter is None:
+            raise RuntimeError(
+                "AgentFactory.invite requires an SLM; pass slm=... to "
+                "AgentFactory(...) or call set_slm() first."
+            )
+        invitations = await self._inviter.invite(
+            domain=domain, subdomain=subdomain, topic=topic,
+            count=count, mode_hint=mode_hint,
+        )
+        result = SpawnResult()
+        for inv in invitations:
+            address = AgentAddress(
+                org=org, role=role, domain=domain, subdomain=subdomain,
+                accept=accept, lifecycle=lifecycle, instance=inv.slug,
+            )
+            self._personas[str(address)] = inv.system
+            if await self._engine.registry.is_alive(address):
+                result.reused.append(address)
+            else:
+                result.new.append(self.create(address))
+        return result
+
+    async def invite_and_start(
+        self,
+        *,
+        org: str,
+        role: str,
+        domain: str,
+        subdomain: str,
+        topic: str,
+        count: int,
+        accept: str = "s",
+        lifecycle: str = "session",
+        mode_hint: str | None = None,
+    ) -> SpawnResult:
+        """:meth:`invite` + ``register()`` + ``start()`` for each new agent."""
+        result = await self.invite(
+            org=org, role=role, domain=domain, subdomain=subdomain,
+            topic=topic, count=count, accept=accept, lifecycle=lifecycle,
+            mode_hint=mode_hint,
+        )
+        for agent in result.new:
+            await agent.register()
+        for agent in result.new:
+            await agent.start()
+        return result

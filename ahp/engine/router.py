@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from ahp.audit import AuditEvent, AuditSink
 from ahp.core.address import AgentAddress
 from ahp.core.codes import Code
 from ahp.core.compatibility import CompatibilityMatrix
@@ -68,6 +69,7 @@ class ProtocolEngine:
         default_timeout: float = DEFAULT_TIMEOUT,
         groups: Any = None,
         scope: ScopePolicy | None = None,
+        audit: AuditSink | None = None,
     ) -> None:
         self.bus = bus
         self.registry = registry
@@ -82,6 +84,8 @@ class ProtocolEngine:
         # Optional access-control layer. Open-default — None means
         # everyone can reach everyone (current behavior preserved).
         self.scope = scope
+        # Optional audit sink for dispatch outcomes.
+        self.audit = audit
 
     # ── entry point ─────────────────────────────────────────────────────
 
@@ -111,7 +115,14 @@ class ProtocolEngine:
             kwargs["timeout"] = timeout
         if message.verb == "CAST-GET":
             kwargs["max_responses"] = max_responses
-        return await dispatch(message, **kwargs)
+
+        try:
+            result = await dispatch(message, **kwargs)
+        except Exception as exc:
+            await self._emit_message(message, success=False, error=_short_err(exc))
+            raise
+        await self._emit_message(message, success=True, result=result)
+        return result
 
     # ── thread convenience ──────────────────────────────────────────────
 
@@ -271,6 +282,52 @@ class ProtocolEngine:
                 f"for code {code!r} under the active ScopePolicy"
             )
 
+    async def _emit_message(
+        self,
+        message: Message,
+        *,
+        success: bool,
+        result: Any = None,
+        error: str | None = None,
+    ) -> None:
+        if self.audit is None:
+            return
+        extra: dict[str, Any] = {}
+        if success:
+            # Best-effort outcome summary per verb.
+            if message.verb in {"SEND", "CAST", "INVALIDATE"}:
+                if isinstance(result, int):
+                    extra["count"] = result
+            elif message.verb == "SEND-GET":
+                extra["hit"] = result is not None
+            elif message.verb == "CAST-GET":
+                if isinstance(result, list):
+                    extra["responses"] = len(result)
+        op = {
+            "SEND": "engine.send",
+            "SEND-GET": "engine.send_get",
+            "CAST": "engine.cast",
+            "CAST-GET": "engine.cast_get",
+            "CAST-SUB": "engine.cast_sub",
+            "INVALIDATE": "engine.invalidate",
+        }.get(message.verb, f"engine.{message.verb.lower()}")
+        principal = (
+            self.registry.principal.id
+            if self.registry.principal is not None
+            else None
+        )
+        await self.audit.emit(AuditEvent(
+            op=op,
+            principal=principal,
+            source=str(message.source),
+            target=str(message.target),
+            code=message.code,
+            verb=message.verb,
+            success=success,
+            error=error,
+            extra=extra,
+        ))
+
     async def _resolve_for_broadcast(self, message: Message) -> list[AgentAddress]:
         """Resolve a broadcast message's target through registry + matrix + scope.
 
@@ -301,3 +358,9 @@ class ProtocolEngine:
                 message.source, candidates, message.code,
             )
         return candidates
+
+
+def _short_err(exc: BaseException) -> str:
+    name = type(exc).__name__
+    msg = str(exc)
+    return f"{name}: {msg}" if msg else name

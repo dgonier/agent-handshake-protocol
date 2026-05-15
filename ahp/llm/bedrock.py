@@ -22,12 +22,20 @@ BEDROCK_DEFAULT_MODEL_ID: str = "anthropic.claude-3-5-sonnet-20241022-v2:0"
 
 
 def _load_dotenv_quiet() -> None:
+    """Load a *project-local* ``.env`` if one sits next to CWD.
+
+    Earlier versions walked all the way up to ``$HOME``; that turned out
+    to be a footgun on developer machines where ``~/.env`` carries
+    unrelated, sometimes malformed, AWS keys that fight with the boto3
+    credentials chain. We now stop at CWD — explicit project envs only.
+    """
     try:
         from dotenv import load_dotenv  # type: ignore[import-not-found]
     except ImportError:
         return
-    # Walk up from CWD looking for a .env file. python-dotenv handles missing files.
-    load_dotenv(override=False)
+    cwd_env = os.path.join(os.getcwd(), ".env")
+    if os.path.isfile(cwd_env):
+        load_dotenv(dotenv_path=cwd_env, override=False)
 
 
 def default_bedrock_model_id() -> str:

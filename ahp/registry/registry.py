@@ -19,6 +19,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, AsyncIterator
 
+from ahp.audit import AuditEvent, AuditSink
 from ahp.core.address import AgentAddress
 from ahp.core.pattern import AddressPattern
 from ahp.registry.auth import (
@@ -67,6 +68,7 @@ class AgentRegistry:
         heartbeat_ttl: int = DEFAULT_HEARTBEAT_TTL,
         principal: Principal | None = None,
         policy: AuthPolicy | None = None,
+        audit: AuditSink | None = None,
     ) -> None:
         if heartbeat_ttl <= 0:
             raise ValueError(f"heartbeat_ttl must be positive, got {heartbeat_ttl}")
@@ -77,6 +79,9 @@ class AgentRegistry:
         # which addresses; see ahp.registry.auth.
         self._principal = principal
         self._policy: AuthPolicy = policy or OpenAuthPolicy()
+        # Audit: optional sink; emit-and-forget for register/heartbeat/
+        # deregister outcomes. Read-side ops stay silent.
+        self._audit = audit
 
     @property
     def principal(self) -> Principal | None:
@@ -104,6 +109,10 @@ class AgentRegistry:
         allowed to claim this address.
         """
         if not self._policy.can_register(self._principal, address):
+            await self._emit(
+                "registry.register", address, success=False,
+                error="UnauthorizedRegistrationError",
+            )
             raise UnauthorizedRegistrationError(
                 f"principal {self._principal.id if self._principal else '<anonymous>'!r} "
                 f"is not authorized to register {address}"
@@ -113,6 +122,7 @@ class AgentRegistry:
             Keys.registry_hash(), str(address), meta.to_json()
         )
         await self._mark_alive(address)
+        await self._emit("registry.register", address)
 
     async def deregister(self, address: AgentAddress) -> None:
         """Remove an agent and its liveness marker.
@@ -120,12 +130,17 @@ class AgentRegistry:
         Consults the active :class:`AuthPolicy`.
         """
         if not self._policy.can_deregister(self._principal, address):
+            await self._emit(
+                "registry.deregister", address, success=False,
+                error="UnauthorizedRegistrationError",
+            )
             raise UnauthorizedRegistrationError(
                 f"principal {self._principal.id if self._principal else '<anonymous>'!r} "
                 f"is not authorized to deregister {address}"
             )
         await self._redis.hdel(Keys.registry_hash(), str(address))
         await self._redis.delete(Keys.alive_key(address))
+        await self._emit("registry.deregister", address)
 
     async def heartbeat(self, address: AgentAddress) -> bool:
         """Refresh an agent's liveness marker.
@@ -136,14 +151,23 @@ class AgentRegistry:
         which is a privileged op.
         """
         if not self._policy.can_heartbeat(self._principal, address):
+            await self._emit(
+                "registry.heartbeat", address, success=False,
+                error="UnauthorizedRegistrationError",
+            )
             raise UnauthorizedRegistrationError(
                 f"principal {self._principal.id if self._principal else '<anonymous>'!r} "
                 f"is not authorized to heartbeat {address}"
             )
         exists = await self._redis.hexists(Keys.registry_hash(), str(address))
         if not exists:
+            await self._emit(
+                "registry.heartbeat", address, success=False,
+                error="NotRegistered",
+            )
             return False
         await self._mark_alive(address)
+        await self._emit("registry.heartbeat", address)
         return True
 
     async def is_alive(self, address: AgentAddress) -> bool:
@@ -220,6 +244,25 @@ class AgentRegistry:
         await self._redis.set(
             Keys.alive_key(address), "1", ex=self._heartbeat_ttl
         )
+
+    async def _emit(
+        self,
+        op: str,
+        address: AgentAddress,
+        *,
+        success: bool = True,
+        error: str | None = None,
+    ) -> None:
+        if self._audit is None:
+            return
+        principal_id = self._principal.id if self._principal else None
+        await self._audit.emit(AuditEvent(
+            op=op,
+            principal=principal_id,
+            target=str(address),
+            success=success,
+            error=error,
+        ))
 
     async def _scan(
         self, *, alive_only: bool,

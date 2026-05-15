@@ -44,6 +44,15 @@ from ahp.adapters.groups import (
     group,
 )
 from ahp.adapters.human import HumanAgent, ObservationLevel
+from ahp.adapters.inviter import AgentInvitation, ChatModel, Inviter
+from ahp.adapters.prompts import (
+    RECIPES,
+    Recipe,
+    RecipeNotFoundError,
+    get_recipe,
+    list_recipes,
+    render,
+)
 from ahp.adapters.provisioning import (
     FieldNamer,
     ProvisioningField,
@@ -74,9 +83,15 @@ from ahp.adapters.tool_registry import (
 __all__ = [
     "AHPAgent",
     "AgentFactory",
+    "AgentInvitation",
     "AgentKind",
     "AgentProfile",
     "Builder",
+    "ChatModel",
+    "Inviter",
+    "RECIPES",
+    "Recipe",
+    "RecipeNotFoundError",
     "CapabilityProvider",
     "CapabilityRegistry",
     "DEFAULT_GROUP_REGISTRY",
@@ -108,7 +123,10 @@ __all__ = [
     "default_namer",
     "fs_mount_description",
     "fs_resource_addresses",
+    "get_recipe",
     "group",
+    "list_recipes",
+    "render",
     "resource",
     "tool",
 ]
