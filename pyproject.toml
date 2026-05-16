@@ -8,7 +8,7 @@ version = "0.24.0"
 description = "Agentic Handshake Protocol — addressable, format-aware messaging between heterogeneous agents."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 authors = [{ name = "AHP Contributors" }]
 dependencies = []
 
