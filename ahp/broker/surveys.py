@@ -178,9 +178,35 @@ class SurveyQueue:
         redis_client: Any,
         *,
         commons_wallet_owner: str = "__commons__",
+        audit: Any = None,
     ) -> None:
         self._redis = redis_client
         self._commons = commons_wallet_owner
+        self._audit = audit
+
+    async def _emit(
+        self,
+        op: str,
+        *,
+        target: str | None = None,
+        success: bool = True,
+        error: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Best-effort audit emission. Never raises."""
+        if self._audit is None:
+            return
+        try:
+            # Local import to avoid a circular import between
+            # ahp.broker.surveys and ahp.audit at module load time.
+            from ahp.audit import AuditEvent
+            await self._audit.emit(AuditEvent(
+                op=op, target=target,
+                success=success, error=error,
+                extra=extra or {},
+            ))
+        except Exception:
+            log.exception("survey audit emit failed for op=%s", op)
 
     # ── enqueue / inspect ────────────────────────────────────────────
 
@@ -206,6 +232,21 @@ class SurveyQueue:
             "survey enqueued: id=%s actor=%s server=%s reward=%.4f",
             request.survey_id, request.surveyed_actor,
             request.target_server, request.reward,
+        )
+        await self._emit(
+            "survey.enqueue",
+            target=request.survey_id,
+            extra={
+                "kind": request.kind,
+                "surveyed_actor": request.surveyed_actor,
+                "target_server": request.target_server,
+                "recipe": request.recipe,
+                "reward": request.reward,
+                "dispatch_at": request.dispatch_at,
+                "expires_at": request.expires_at,
+                "consent_csat_routing_at_queue": request.consent_csat_routing_at_queue,
+                "consent_training_export_at_queue": request.consent_training_export_at_queue,
+            },
         )
         return True
 
@@ -304,6 +345,18 @@ class SurveyQueue:
         log.info(
             "survey response submitted: id=%s actor=%s score=%.2f",
             response.survey_id, response.surveyed_actor, response.score,
+        )
+        await self._emit(
+            "survey.response",
+            target=response.survey_id,
+            extra={
+                "surveyed_actor": response.surveyed_actor,
+                "target_server": response.target_server,
+                "score": response.score,
+                "consent_csat_routing": response.consent_csat_routing,
+                "consent_training_export": response.consent_training_export,
+                "has_free_text": bool(response.free_text),
+            },
         )
         return True
 

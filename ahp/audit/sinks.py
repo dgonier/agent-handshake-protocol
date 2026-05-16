@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from typing import Iterable, Protocol, runtime_checkable
+from typing import Any, Iterable, Protocol, runtime_checkable
 
 from ahp.audit.event import AuditEvent
 
@@ -112,3 +112,68 @@ class MultiSink:
                 await sink.emit(event)
             except Exception:
                 log.exception("audit sink %r raised; continuing", sink)
+
+
+DEFAULT_REDIS_AUDIT_STREAM: str = "ahp:audit:stream"
+"""Default Redis Streams key for :class:`RedisStreamAuditSink`.
+
+Lives in the same ``ahp:`` namespace as the rest of the wire layer.
+``XADD`` is O(1) so the audit hot path stays cheap; consumers use
+``XRANGE`` / ``XREAD`` to tail.
+"""
+
+
+class RedisStreamAuditSink:
+    """Writes events to a Redis Streams key.
+
+    Same Redis the rest of AHP already uses. ``XADD`` with the
+    ``MAXLEN ~`` trimming option bounds the stream so a long-running
+    process can't blow up memory — capped at ``maxlen`` entries with
+    Redis's approximate-trim semantics (cheap; tolerates a small
+    overshoot).
+
+    Cross-process visibility: any process pointed at the same Redis
+    can tail the same stream. That's the audit story for a multi-host
+    deployment of the protocol.
+
+    Each event is stored as a single field ``data`` whose value is the
+    event's compact JSON. Sticking to one field keeps consumers simple
+    (parse one JSON per entry) and avoids the trade-off of "do I make
+    every event-field a stream field?" which couples the schema to
+    Redis.
+    """
+
+    def __init__(
+        self,
+        redis_client: Any,
+        *,
+        stream_key: str = DEFAULT_REDIS_AUDIT_STREAM,
+        maxlen: int = 10_000,
+    ) -> None:
+        if maxlen <= 0:
+            raise ValueError(f"maxlen must be positive, got {maxlen}")
+        self._redis = redis_client
+        self._stream_key = stream_key
+        self._maxlen = maxlen
+
+    @property
+    def stream_key(self) -> str:
+        return self._stream_key
+
+    async def emit(self, event: AuditEvent) -> None:
+        try:
+            await self._redis.xadd(
+                self._stream_key,
+                {"data": event.to_json()},
+                maxlen=self._maxlen,
+                approximate=True,
+            )
+        except Exception:
+            # Mirror the policy from MultiSink: audit failures must
+            # not propagate into the protocol hot path. Log once and
+            # carry on. The caller may still pair us with another sink
+            # (InMemory, Logging) via MultiSink for redundancy.
+            log.exception(
+                "RedisStreamAuditSink: XADD to %s failed; dropping event",
+                self._stream_key,
+            )

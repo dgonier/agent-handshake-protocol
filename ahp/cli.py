@@ -1025,6 +1025,159 @@ def cmd_describe_agent(args: argparse.Namespace, out: TextIO) -> int:
     return asyncio.run(_describe_agent_async(args, out))
 
 
+# ── audit-tail ────────────────────────────────────────────────────────
+
+
+def _format_audit_line(stream_id: str, payload: dict[str, Any]) -> str:
+    """One terse line per audit event."""
+    when = time.strftime(
+        "%Y-%m-%dT%H:%M:%S",
+        time.localtime(payload.get("timestamp") or time.time()),
+    )
+    op = payload.get("op", "?")
+    target = payload.get("target") or "-"
+    success = payload.get("success", True)
+    suffix = "" if success else f"  ERROR={payload.get('error') or ''}"
+    extra = payload.get("extra") or {}
+    extra_repr = ""
+    if extra:
+        try:
+            extra_repr = "  " + json.dumps(extra, default=str)
+        except Exception:
+            extra_repr = "  " + str(extra)
+        if len(extra_repr) > 120:
+            extra_repr = extra_repr[:117] + "..."
+    return f"{when}  {stream_id}  {op:32s}  target={target}{suffix}{extra_repr}"
+
+
+async def _audit_tail_async(args: argparse.Namespace, out: TextIO) -> int:
+    """Read audit events from a Redis Streams key produced by
+    :class:`RedisStreamAuditSink`.
+
+    Two modes:
+      * one-shot (default): XRANGE from --since (default '-' = oldest)
+        up to --limit entries, print, exit.
+      * --follow: after the initial range, keep XREADing for new
+        entries with a BLOCK timeout. Ctrl-C exits.
+
+    --op accepts a hierarchical glob (e.g. ``broker.*``,
+    ``survey.response``) and filters client-side.
+    """
+    from ahp.audit import DEFAULT_REDIS_AUDIT_STREAM
+    from ahp.core.codes import Code
+
+    client = _connect_redis(args.redis_url)
+    stream_key = args.stream or DEFAULT_REDIS_AUDIT_STREAM
+    seen = 0
+    last_id: str = args.since or "-"
+
+    def _matches(payload: dict[str, Any]) -> bool:
+        if args.op and not Code.matches(payload.get("op", ""), args.op):
+            return False
+        if args.target_contains and args.target_contains not in (
+            payload.get("target") or ""
+        ):
+            return False
+        return True
+
+    try:
+        # Initial range: from `since` (or oldest) forward.
+        entries = await client.xrange(
+            stream_key, min=last_id, max="+",
+            count=args.limit if args.limit else None,
+        )
+        for entry_id, fields in entries:
+            if isinstance(entry_id, (bytes, bytearray)):
+                entry_id = entry_id.decode("utf-8")
+            raw = fields.get("data")
+            if raw is None:
+                continue
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8")
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if not _matches(payload):
+                continue
+            print(_format_audit_line(entry_id, payload), file=out, flush=True)
+            seen += 1
+            last_id = entry_id
+            if args.limit and seen >= args.limit:
+                return 0
+
+        if not args.follow:
+            if seen == 0:
+                print(
+                    f"(no audit entries on {stream_key})",
+                    file=out,
+                )
+            return 0
+
+        # Follow mode: tail forever via XREAD with BLOCK.
+        print(
+            f"tail: following {stream_key} (Ctrl-C to stop)…",
+            file=out, flush=True,
+        )
+        # XREAD wants the "next entry after this id"; '$' means "only
+        # new entries from now", which is what we want after the
+        # initial range.
+        cursor = last_id if last_id != "-" else "$"
+        while True:
+            try:
+                resp = await client.xread(
+                    {stream_key: cursor},
+                    block=1000,  # 1s block; loop to allow Ctrl-C.
+                    count=50,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("xread failed; backing off 500ms")
+                await asyncio.sleep(0.5)
+                continue
+            if not resp:
+                continue
+            for _stream, entries in resp:
+                for entry_id, fields in entries:
+                    if isinstance(entry_id, (bytes, bytearray)):
+                        entry_id = entry_id.decode("utf-8")
+                    raw = fields.get("data")
+                    if raw is None:
+                        continue
+                    if isinstance(raw, (bytes, bytearray)):
+                        raw = raw.decode("utf-8")
+                    try:
+                        payload = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    cursor = entry_id
+                    if not _matches(payload):
+                        continue
+                    print(
+                        _format_audit_line(entry_id, payload),
+                        file=out, flush=True,
+                    )
+                    seen += 1
+                    if args.limit and seen >= args.limit:
+                        return 0
+    except asyncio.CancelledError:
+        pass
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+    return 0
+
+
+def cmd_audit_tail(args: argparse.Namespace, out: TextIO) -> int:
+    try:
+        return asyncio.run(_audit_tail_async(args, out))
+    except KeyboardInterrupt:
+        return 0
+
+
 def cmd_start_agent(args: argparse.Namespace, out: TextIO) -> int:
     return asyncio.run(_start_agent_async(args, out))
 
@@ -1412,6 +1565,43 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Redis URL (default: {default_url})",
     )
     p_desc.set_defaults(func=cmd_describe_agent)
+
+    # audit-tail — read from RedisStreamAuditSink
+    p_at = sub.add_parser(
+        "audit-tail",
+        help="read audit events from a RedisStreamAuditSink-backed stream",
+    )
+    p_at.add_argument(
+        "--redis-url", default=default_url,
+        help=f"Redis URL (default: {default_url})",
+    )
+    p_at.add_argument(
+        "--stream",
+        help="stream key (default: ahp:audit:stream — "
+             "DEFAULT_REDIS_AUDIT_STREAM)",
+    )
+    p_at.add_argument(
+        "--since",
+        help="start from this stream id (default: '-' = from oldest)",
+    )
+    p_at.add_argument(
+        "--op",
+        help="filter to events whose op matches this hierarchical glob "
+             "(e.g. 'broker.*', 'survey.response', 'registry.*')",
+    )
+    p_at.add_argument(
+        "--target-contains", dest="target_contains",
+        help="filter to events whose target field contains this substring",
+    )
+    p_at.add_argument(
+        "--limit", type=int, default=100,
+        help="max entries to print (default: 100; 0 = unlimited)",
+    )
+    p_at.add_argument(
+        "--follow", action="store_true",
+        help="after the initial range, tail for new entries via XREAD",
+    )
+    p_at.set_defaults(func=cmd_audit_tail)
 
     return parser
 
