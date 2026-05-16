@@ -87,11 +87,61 @@ class Broker:
 
     # ── compute provider lifecycle ────────────────────────────────────
 
-    async def register_compute_provider(self, provider: ComputeProvider) -> None:
-        await self.compute.register_provider(provider)
+    async def register_compute_provider(
+        self,
+        provider: ComputeProvider,
+        *,
+        prove_alive: bool = True,
+    ) -> None:
+        """Persist a compute provider's metadata.
+
+        ``prove_alive=False`` requires the provider to send an explicit
+        ``heartbeat_compute_provider`` call before its leaves become
+        visible — the "health must be proven before you're on the menu"
+        path. Default ``True`` matches the self-hosted case where
+        registration is also the first heartbeat.
+        """
+        await self.compute.register_provider(provider, prove_alive=prove_alive)
+
+    async def deregister_compute_provider(
+        self,
+        provider_id: str,
+        *,
+        graceful: bool = True,
+    ) -> None:
+        """Drop a provider. ``graceful=False`` arms an outage credit
+        on the next ``check_compute_outages()`` sweep, in case the
+        watchdog has detected the provider failed without saying so."""
+        await self.compute.deregister_provider(provider_id, graceful=graceful)
+
+    async def heartbeat_compute_provider(self, provider_id: str) -> bool:
+        return await self.compute.heartbeat_provider(provider_id)
 
     async def register_leaf(self, leaf: MenuLeaf) -> None:
         await self.compute.register_leaf(leaf)
+
+    async def check_compute_outages(self) -> list[str]:
+        """Detect and credit any unplanned-outage events for compute
+        providers since the last sweep.
+
+        For each provider whose last-seen sentinel survived past its
+        heartbeat TTL without a graceful deregister, this folds a
+        ``timeout`` outcome into that provider's reputation record and
+        returns the provider id. Idempotent — the same outage is only
+        credited once because ``detect_outage`` clears the sentinel.
+        """
+        hit: list[str] = []
+        for provider in await self.compute.list_providers():
+            if await self.compute.detect_outage(provider.provider_id):
+                await self.record_outcome(
+                    provider.provider_id,
+                    "timeout",
+                    latency_ms=0.0,
+                    response_chars=0,
+                    max_response_chars=0,
+                )
+                hit.append(provider.provider_id)
+        return hit
 
     # ── routing ──────────────────────────────────────────────────────
 

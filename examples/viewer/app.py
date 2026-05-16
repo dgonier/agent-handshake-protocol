@@ -211,7 +211,9 @@ def _load_run(run_id: str) -> DebateResult | None:
     data.setdefault("elapsed_closing", 0.0)
     data.setdefault("wallets", {})
     data.setdefault("server_meta", {})
+    data.setdefault("servers", [])
     data.setdefault("compute_menu", [])
+    data.setdefault("settlements", [])
     return DebateResult(**data)
 
 
@@ -411,13 +413,16 @@ async def economy(request: Request):
 @app.get("/api/economy")
 async def api_economy():
     if state.latest is None:
-        return JSONResponse(
-            {"wallets": {}, "server_meta": {}, "compute_menu": []},
-        )
+        return JSONResponse({
+            "wallets": {}, "server_meta": {}, "servers": [],
+            "compute_menu": [], "settlements": [],
+        })
     return {
         "wallets": state.latest.wallets,
         "server_meta": state.latest.server_meta,
+        "servers": state.latest.servers,
         "compute_menu": state.latest.compute_menu,
+        "settlements": state.latest.settlements,
     }
 
 

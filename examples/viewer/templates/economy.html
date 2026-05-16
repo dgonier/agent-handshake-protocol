@@ -38,7 +38,34 @@
     </table>
   </div>
 
-  {% if result.server_meta %}
+  {% if result.servers and result.servers|length > 0 %}
+    <h2>Servers ({{ result.servers|length }})</h2>
+    <p class="meta">Registered with the broker for this run. Each server picks the best compute leaf matching its <code>compute_binding</code>.</p>
+    <div class="card scroll-x">
+      <table>
+        <thead>
+          <tr>
+            <th>org</th>
+            <th>base_rate</th>
+            <th>compute_binding</th>
+            <th>rank_by</th>
+            <th>tiers</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for s in result.servers %}
+            <tr>
+              <td class="mono">{{ s.org }}</td>
+              <td><code>{{ s.base_rate }}</code></td>
+              <td class="mono"><code>{{ s.compute_binding }}</code></td>
+              <td><code>{{ s.compute_ranking }}</code></td>
+              <td><code>{{ s.supported_tiers|join(", ") }}</code></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% elif result.server_meta %}
     <h2>Server</h2>
     <p class="meta">Self-hosted server registered with the broker for this run.</p>
     <div class="card">
@@ -47,6 +74,47 @@
       <div><strong>base_rate:</strong> <code>{{ result.server_meta.base_rate }}</code> credits/char/tier-unit</div>
       <div><strong>compute_binding:</strong> <code>{{ result.server_meta.compute_binding }}</code></div>
       <div><strong>supported_tiers:</strong> <code>{{ result.server_meta.supported_tiers|join(", ") }}</code></div>
+    </div>
+  {% endif %}
+
+  {% if result.settlements %}
+    <h2>Recent settlements ({{ result.settlements|length }})</h2>
+    <p class="meta">
+      Every successful dispatch that the broker settled during this run.
+      Each row is one response that earned the responding server its
+      <code>to_server</code> share; <code>to_compute</code> flows to the
+      compute provider (or back to the server when self-hosted);
+      <code>to_broker</code> + <code>to_commons</code> are the 5% tax.
+    </p>
+    <div class="card scroll-x">
+      <table>
+        <thead>
+          <tr>
+            <th>server</th>
+            <th>compute leaf</th>
+            <th>chars</th>
+            <th>latency</th>
+            <th>pre_tax</th>
+            <th>→ server</th>
+            <th>→ compute</th>
+            <th>→ tax</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for s in result.settlements %}
+            <tr>
+              <td class="mono">{{ s.server_org }}</td>
+              <td class="mono">{{ s.compute_leaf or "—" }}</td>
+              <td><code>{{ s.effective_chars }}</code></td>
+              <td><code>{{ "%.0f"|format(s.actual_latency_ms) }}ms</code></td>
+              <td><code>{{ "%.4f"|format(s.pre_tax) }}</code></td>
+              <td><code>{{ "%.4f"|format(s.to_server) }}</code></td>
+              <td><code>{{ "%.4f"|format(s.to_compute) }}</code></td>
+              <td><code>{{ "%.4f"|format(s.to_broker + s.to_commons) }}</code></td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
     </div>
   {% endif %}
 

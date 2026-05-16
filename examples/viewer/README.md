@@ -59,6 +59,14 @@ Env vars (all optional, sensible defaults baked into the compose file):
 | `VIEWER_CLOUDWATCH_GROUP`   | `/ahp/astrophysics-demo` (empty disables)            |
 | `VIEWER_DEFAULT_TOPIC`      | `What caused the Big Bang?`                          |
 | `VIEWER_DEFAULT_SUBDOMAIN`  | `astrophysics`                                       |
+| `AHP_MODAL_VLLM_URL`        | unset → metadata-only Modal provider stays *off*. Set to the OpenAI-compatible base URL (e.g. a Modal vLLM deployment) to register a second compute provider alongside the self-hosted Bedrock leaf. |
+| `AHP_MODAL_VLLM_MODEL`      | `qwen2-5-7b` — slug used in the MenuLeaf address.    |
+| `AHP_MODAL_VLLM_TIER`       | `small` — tier mapping for the Modal leaf.           |
+| `AHP_MODAL_VLLM_RATE`       | `0.00015` — credits/1k chars charged by Modal.       |
+| `AHP_MODAL_VLLM_LATENCY_MS` | `8000` — honest p95 covering vLLM cold starts.       |
+| `AHP_MODAL_VLLM_PROVE_HEALTH` | `0` — when `1`, probe `GET {URL}/models` and flip the provider to alive on 2xx. Otherwise it stays metadata-only and isn't routable. |
+| `AHP_SECONDARY_ORG`         | `beta` — when the Modal URL is set, a second server is registered under this org with `compute_binding` pointing at the Modal leaf. Set to the same value as the primary org (`tifin` by default) or `AHP_DISABLE_SECONDARY_SERVER=1` to skip. |
+| `AHP_SECONDARY_BASE_RATE`   | `0.00025` — the secondary server's posted base rate. |
 
 ## Public exposure (optional)
 

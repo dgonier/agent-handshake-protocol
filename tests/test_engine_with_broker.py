@@ -266,3 +266,193 @@ async def test_engine_without_broker_still_dispatches(redis_client):
 
     await agent.stop()
     await bus.close()
+
+
+# ── CAST-GET broker path ─────────────────────────────────────────────
+
+
+@pytest.fixture
+async def cast_broker_stack(redis_client):
+    """Two echo agents under different orgs (``acme`` and ``beta``),
+    each owned by its own server bound to a self-hosted compute leaf.
+
+    Used for exercising the CAST-GET broker path's per-target hold +
+    per-response settlement against multiple orgs in one broadcast.
+    """
+    from ahp.core import AddressPattern
+    bus = RedisBus(redis_client)
+    registry = AgentRegistry(redis_client, heartbeat_ttl=30)
+    cache = ProtocolCache(redis_client)
+    threads = ThreadManager(redis_client, bus)
+    broker = Broker(redis_client)
+    engine = ProtocolEngine(
+        bus, registry, cache, CompatibilityMatrix(), threads,
+        default_timeout=2.0, broker=broker,
+    )
+
+    # Two servers, each with its own compute leaf.
+    for org_name in ("acme", "beta"):
+        srv = ServerMeta(
+            server_id=org_name, org=org_name, base_rate=0.0002,
+            compute_binding=f"{org_name}.small.echo",
+            supported_tiers=["small"],
+        )
+        await broker.register_server(srv)
+        await broker.register_compute_provider(
+            ComputeProvider(provider_id=org_name),
+        )
+        await broker.register_leaf(MenuLeaf(
+            provider_id=org_name, tier="small", model="echo",
+            rate_per_1k_chars=0.0,
+        ))
+        await broker.set_reputation(ReputationEntry(
+            owner=org_name, reputation=0.9,
+            completed_accepted=VISIBILITY_FULL_AT,
+        ))
+
+    # One echo agent per org.
+    agents: list[_EchoAgent] = []
+    for org_name in ("acme", "beta"):
+        addr = AgentAddress.parse(
+            f"{org_name}.researcher.x.y.s.session.echo-0",
+        )
+        a = _EchoAgent(address=addr, engine=engine)
+        await a.register()
+        await a.start()
+        agents.append(a)
+    await asyncio.sleep(0.1)
+
+    caller = AgentAddress.parse("you.human.x.y.s.session.caller")
+    await broker.wallet(str(caller)).topup(50.0, reason="test seed")
+    await registry.register(caller)
+
+    pattern = AddressPattern.parse("*.researcher.x.y.*.*.*")
+
+    class Stack:
+        pass
+    s = Stack()
+    s.engine = engine
+    s.broker = broker
+    s.bus = bus
+    s.caller = caller
+    s.pattern = pattern
+    s.agents = agents
+    try:
+        yield s
+    finally:
+        for a in agents:
+            await a.stop()
+        await bus.close()
+
+
+async def test_cast_get_settles_each_responder_independently(cast_broker_stack):
+    """Every responder gets settled against its own per-target hold."""
+    s = cast_broker_stack
+    caller_before = (await s.broker.wallet(str(s.caller)).get_state()).balance
+    acme_before = (await s.broker.wallet("acme").get_state()).balance
+    beta_before = (await s.broker.wallet("beta").get_state()).balance
+    broker_before = (await s.broker.wallet("__broker__").get_state()).balance
+
+    msg = Message(
+        source=s.caller, target=s.pattern,
+        code=Code.INTERVIEW_TEXT, verb="CAST-GET",
+        body="hello", thread="t::cast::1",
+    )
+    responses = await s.engine.handle(msg, timeout=2.0, max_responses=2)
+    assert len(responses) == 2
+    responding_orgs = {r.source.org for r in responses}
+    assert responding_orgs == {"acme", "beta"}
+
+    caller_after = (await s.broker.wallet(str(s.caller)).get_state()).balance
+    acme_after = (await s.broker.wallet("acme").get_state()).balance
+    beta_after = (await s.broker.wallet("beta").get_state()).balance
+    broker_after = (await s.broker.wallet("__broker__").get_state()).balance
+
+    # Both servers earned.
+    assert acme_after > acme_before
+    assert beta_after > beta_before
+    # Caller paid.
+    assert caller_after < caller_before
+    # Tax flowed at least once.
+    assert broker_after >= broker_before
+    # And there are no outstanding holds left on the caller.
+    caller_state = await s.broker.wallet(str(s.caller)).get_state()
+    cast_hold_ids = [h for h in caller_state.holds if "cast_get" in h or "msg:" in h]
+    # All cast_get holds should have settled or refunded — none open.
+    # (Some refunded holds may stay as zero entries, but no positive
+    # holds with cast IDs should remain.)
+    for hid in cast_hold_ids:
+        assert caller_state.holds.get(hid, 0.0) == 0.0
+
+
+async def test_cast_get_refunds_silent_target_holds(cast_broker_stack):
+    """When a target doesn't respond inside the window, its per-target
+    hold is refunded — the responding targets still settle."""
+    s = cast_broker_stack
+    # Stop one of the agents so it doesn't respond.
+    silent_agent = s.agents[1]   # beta
+    await silent_agent.stop()
+    await silent_agent.deregister()
+    await asyncio.sleep(0.05)
+
+    caller_before = (await s.broker.wallet(str(s.caller)).get_state()).balance
+    beta_before = (await s.broker.wallet("beta").get_state()).balance
+
+    msg = Message(
+        source=s.caller, target=s.pattern,
+        code=Code.INTERVIEW_TEXT, verb="CAST-GET",
+        body="hello", thread="t::cast::silent",
+    )
+    responses = await s.engine.handle(msg, timeout=1.0, max_responses=2)
+    # Acme responds, beta doesn't.
+    assert len(responses) == 1
+    assert responses[0].source.org == "acme"
+
+    # Beta got no work, no earnings.
+    beta_after = (await s.broker.wallet("beta").get_state()).balance
+    assert beta_after == beta_before
+
+    # Caller's outstanding holds for cast_get should all be cleared.
+    caller_state = await s.broker.wallet(str(s.caller)).get_state()
+    for hid, amt in caller_state.holds.items():
+        assert amt == 0.0, f"hold {hid} still open after refund"
+
+
+async def test_cast_get_without_broker_unchanged(redis_client):
+    """A bare engine (no broker wired) handles CAST-GET like before:
+    direct bus.cast_get, no holds, no settlements."""
+    from ahp.core import AddressPattern
+    bus = RedisBus(redis_client)
+    registry = AgentRegistry(redis_client, heartbeat_ttl=30)
+    cache = ProtocolCache(redis_client)
+    threads = ThreadManager(redis_client, bus)
+    engine = ProtocolEngine(
+        bus, registry, cache, CompatibilityMatrix(), threads,
+        default_timeout=2.0,
+    )
+
+    agents: list[_EchoAgent] = []
+    for org_name in ("acme", "beta"):
+        addr = AgentAddress.parse(
+            f"{org_name}.researcher.x.y.s.session.echo-z",
+        )
+        a = _EchoAgent(address=addr, engine=engine)
+        await a.register()
+        await a.start()
+        agents.append(a)
+    await asyncio.sleep(0.1)
+
+    caller = AgentAddress.parse("you.human.x.y.s.session.caller-bare")
+    await registry.register(caller)
+
+    msg = Message(
+        source=caller, target=AddressPattern.parse("*.researcher.x.y.*.*.*"),
+        code=Code.INTERVIEW_TEXT, verb="CAST-GET",
+        body="hello", thread="t::nobroker-cast",
+    )
+    responses = await engine.handle(msg, timeout=2.0, max_responses=2)
+    assert len(responses) == 2
+
+    for a in agents:
+        await a.stop()
+    await bus.close()

@@ -68,6 +68,255 @@ def _model_short(model_id: str) -> str:
     return cleaned or "model"
 
 
+async def _maybe_register_modal_vllm(broker: Any) -> None:
+    """Register a Modal vLLM compute provider when explicitly enabled.
+
+    Reads four env vars:
+
+    * ``AHP_MODAL_VLLM_URL``   — the OpenAI-compatible base URL.
+      When unset, this function is a no-op (the everyday demo path).
+    * ``AHP_MODAL_VLLM_MODEL`` — slug used in the MenuLeaf address.
+      Defaults to ``"qwen2-5-7b"``.
+    * ``AHP_MODAL_VLLM_TIER``  — tier mapping (``tiny|small|medium|big``).
+      Defaults to ``"small"`` so a Modal box and the Bedrock self-hosted
+      leaf can compete on the same tier.
+    * ``AHP_MODAL_VLLM_RATE``  — credits charged per 1k chars. Defaults
+      to ``0.00015`` (slightly under the Bedrock posted rate so the
+      menu *would* prefer Modal if a server's compute_binding spanned
+      both — useful for the multi-compute story).
+
+    No inference call is made here; we only publish menu metadata so
+    the broker can route to it and the viewer's economy panel can
+    render it. Set the env vars during recording; leave them unset
+    otherwise.
+    """
+    base_url = os.environ.get("AHP_MODAL_VLLM_URL", "").strip()
+    if not base_url:
+        return
+    from ahp.economy.compute_provider import ComputeProvider, MenuLeaf
+    model = os.environ.get("AHP_MODAL_VLLM_MODEL", "qwen2-5-7b").strip()
+    tier = os.environ.get("AHP_MODAL_VLLM_TIER", "small").strip()
+    try:
+        rate = float(os.environ.get("AHP_MODAL_VLLM_RATE", "0.00015"))
+    except ValueError:
+        rate = 0.00015
+    # Health-proof check: when AHP_MODAL_VLLM_PROVE_HEALTH=1 we do a
+    # cheap GET against {base_url}/models before flipping the provider
+    # to alive. Otherwise the registration is metadata-only and the
+    # leaf stays invisible until something heartbeats it — matching
+    # the protocol's "prove health to be on the menu" rule.
+    prove_health = os.environ.get("AHP_MODAL_VLLM_PROVE_HEALTH", "0") == "1"
+    proven = False
+    if prove_health:
+        proven = await _ping_openai_compatible(base_url)
+    try:
+        # prove_alive=False because we want the explicit heartbeat path
+        # to control visibility — registration alone shouldn't claim
+        # health for a remote endpoint.
+        await broker.register_compute_provider(
+            ComputeProvider(
+                provider_id="modal-vllm",
+                operator="user-modal-account",
+                endpoint=base_url,
+                region=os.environ.get("AHP_MODAL_VLLM_REGION", "us-east"),
+                metadata={"base_url": base_url, "auth": "bearer"},
+            ),
+            prove_alive=False,
+        )
+        await broker.register_leaf(MenuLeaf(
+            provider_id="modal-vllm",
+            tier=tier,  # type: ignore[arg-type]
+            model=model,
+            rate_per_1k_chars=rate,
+            # Modal vLLM cold-starts: advertise honestly. Servers that
+            # care about p95 will rank Bedrock above this anyway.
+            latency_p95_ms=float(os.environ.get(
+                "AHP_MODAL_VLLM_LATENCY_MS", "8000",
+            )),
+            capacity=float(os.environ.get("AHP_MODAL_VLLM_CAPACITY", "0.5")),
+        ))
+        if proven:
+            await broker.heartbeat_compute_provider("modal-vllm")
+            log.info(
+                "registered + proven-alive modal-vllm: %s.%s.%s @ %s/1k chars",
+                "modal-vllm", tier, model, rate,
+            )
+        else:
+            log.info(
+                "registered modal-vllm metadata-only (no health proof yet): %s.%s.%s",
+                "modal-vllm", tier, model,
+            )
+    except Exception:
+        log.exception("failed to register modal-vllm provider — continuing without it")
+
+
+async def _maybe_register_secondary_server(
+    broker: Any, *, primary_org: str,
+) -> Any:
+    """Register a second :class:`ServerMeta` bound to the Modal leaf.
+
+    Off by default. Activates whenever ``AHP_MODAL_VLLM_URL`` is set —
+    the same env gate as the Modal compute provider, so the two come
+    online together. The secondary server's id matches its org (the
+    engine's broker path resolves ``target.org → owning server``), so
+    any session-agent under that org will route its settlements
+    through this server and its bound compute leaf.
+
+    Returns the :class:`ServerMeta` if registered, otherwise ``None``.
+    """
+    if not os.environ.get("AHP_MODAL_VLLM_URL", "").strip():
+        return None
+    if os.environ.get("AHP_DISABLE_SECONDARY_SERVER") == "1":
+        return None
+    from ahp.broker import ServerMeta
+    from ahp.economy.reputation import ReputationEntry, VISIBILITY_FULL_AT
+    secondary_org = os.environ.get("AHP_SECONDARY_ORG", "beta").strip().lower()
+    if secondary_org == primary_org:
+        # No-op rather than error: the configured pair collapses.
+        log.warning(
+            "secondary org collides with primary (%s); skipping secondary server",
+            primary_org,
+        )
+        return None
+    model = os.environ.get("AHP_MODAL_VLLM_MODEL", "qwen2-5-7b").strip()
+    tier = os.environ.get("AHP_MODAL_VLLM_TIER", "small").strip()
+    try:
+        base_rate = float(os.environ.get("AHP_SECONDARY_BASE_RATE", "0.00025"))
+    except ValueError:
+        base_rate = 0.00025
+    meta = ServerMeta(
+        server_id=secondary_org,
+        org=secondary_org,
+        operator="modal-vllm-pool",
+        base_rate=base_rate,
+        compute_binding=f"modal-vllm.{tier}.{model}",
+        supported_tiers=[tier, "medium"],
+        compute_ranking=os.environ.get("AHP_SECONDARY_RANKING", "cheapest"),
+    )
+    try:
+        await broker.register_server(meta)
+        await broker.set_reputation(ReputationEntry(
+            owner=secondary_org,
+            reputation=0.85,
+            completed_accepted=VISIBILITY_FULL_AT,
+        ))
+        # Fund the secondary server's wallet so it can seed any agents
+        # provisioned under its org (none, in the default single-org
+        # runner — but the wallet is there for future expansion).
+        from ahp.economy.agent_banker import STARTING_FUND_BY_LIFECYCLE
+        await broker.wallet(secondary_org).topup(
+            STARTING_FUND_BY_LIFECYCLE["session"] * 4,
+            reason="seed secondary server",
+        )
+        log.info(
+            "registered secondary server: org=%s base_rate=%s binding=%s",
+            secondary_org, base_rate, meta.compute_binding,
+        )
+        return meta
+    except Exception:
+        log.exception("failed to register secondary server — continuing without it")
+        return None
+
+
+async def _ping_openai_compatible(base_url: str) -> bool:
+    """Best-effort liveness probe against an OpenAI-compatible endpoint.
+
+    Hits ``GET {base_url}/models`` with a 3s timeout. Returns True on
+    HTTP 2xx, False on anything else (including the import-failure
+    path when ``httpx`` isn't installed). This is intentionally
+    lenient — we only want a "yes, something is at the URL" signal,
+    not a full handshake.
+    """
+    try:
+        import httpx  # type: ignore[import-not-found]
+    except ImportError:
+        log.warning("httpx not installed; skipping modal-vllm health probe")
+        return False
+    url = base_url.rstrip("/") + "/models"
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(
+                url,
+                headers={
+                    "Authorization": f"Bearer {os.environ.get('OPENROUTER_API_KEY', 'sk-noop')}",
+                },
+            )
+        return 200 <= resp.status_code < 300
+    except Exception:
+        log.exception("modal-vllm health probe failed for %s", url)
+        return False
+
+
+# ── recording broker ──────────────────────────────────────────────────
+
+
+class RecordingBroker:
+    """Thin proxy around :class:`ahp.broker.Broker` that records each
+    successful settlement to an in-process list.
+
+    The engine's broker path calls ``calculate_and_settle`` once per
+    successful dispatch. We intercept those calls to build a per-run
+    settlement log the viewer can render. Everything else passes
+    through via ``__getattr__``.
+
+    Why a proxy rather than subclass: ``Broker.__init__`` initializes
+    a non-trivial composition of registries; preserving construction
+    order via subclassing is more brittle than delegation.
+    """
+
+    def __init__(self, broker: Any) -> None:
+        self._inner = broker
+        self.settlements: list[dict[str, Any]] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def calculate_and_settle(
+        self,
+        *,
+        caller: str,
+        hold_id: str,
+        server: Any,
+        leaf: Any,
+        response_chars: int,
+        max_response_chars: int,
+        actual_latency_ms: float,
+        completed_with_caller: int,
+        tier_verdict: str = "matched",
+    ) -> Any:
+        settlement = await self._inner.calculate_and_settle(
+            caller=caller, hold_id=hold_id,
+            server=server, leaf=leaf,
+            response_chars=response_chars,
+            max_response_chars=max_response_chars,
+            actual_latency_ms=actual_latency_ms,
+            completed_with_caller=completed_with_caller,
+            tier_verdict=tier_verdict,
+        )
+        try:
+            self.settlements.append({
+                "caller": caller,
+                "server_id": server.server_id,
+                "server_org": server.org,
+                "compute_leaf": leaf.address if leaf is not None else None,
+                "compute_provider": leaf.provider_id if leaf is not None else None,
+                "response_chars": int(response_chars),
+                "max_response_chars": int(max_response_chars),
+                "actual_latency_ms": round(float(actual_latency_ms), 2),
+                "tier_verdict": tier_verdict,
+                "pre_tax": round(float(settlement.pre_tax), 6),
+                "to_server": round(float(settlement.to_server), 6),
+                "to_compute": round(float(settlement.to_compute), 6),
+                "to_broker": round(float(settlement.to_broker), 6),
+                "to_commons": round(float(settlement.to_commons), 6),
+                "effective_chars": int(settlement.effective_chars),
+                "at": time.time(),
+            })
+        except Exception:
+            log.exception("settlement recording failed; ignoring")
+        return settlement
+
+
 # ── result types ──────────────────────────────────────────────────────
 
 
@@ -114,7 +363,9 @@ class DebateResult:
     # Economy snapshot — captured at end-of-run.
     wallets: dict[str, float] = field(default_factory=dict)
     server_meta: dict[str, Any] = field(default_factory=dict)
+    servers: list[dict[str, Any]] = field(default_factory=list)
     compute_menu: list[dict[str, Any]] = field(default_factory=list)
+    settlements: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -356,7 +607,7 @@ async def run_debate(
     from ahp.broker import Broker, ServerMeta
     from ahp.economy.compute_provider import ComputeProvider, MenuLeaf
     from ahp.economy.reputation import ReputationEntry, VISIBILITY_FULL_AT
-    broker = Broker(redis)
+    broker = RecordingBroker(Broker(redis))
     server_meta = ServerMeta(
         server_id=org,
         org=org,
@@ -377,6 +628,17 @@ async def run_debate(
     await broker.set_reputation(ReputationEntry(
         owner=org, reputation=0.9, completed_accepted=VISIBILITY_FULL_AT,
     ))
+    # Optionally register a Modal vLLM compute provider alongside the
+    # self-hosted Bedrock leaf. Gated by env so the everyday demo never
+    # pays cold-start time; flip it on for the recorded walkthrough.
+    await _maybe_register_modal_vllm(broker)
+    # When the Modal leaf is wired, also register a *second* server
+    # ("beta" org by default) bound to that leaf. This makes the
+    # multi-compute story concrete: two servers, two compute backends,
+    # one broker — the routing decision selects between them per call.
+    secondary_server_meta = await _maybe_register_secondary_server(
+        broker, primary_org=org,
+    )
     # Seed the broker + commons wallets so the tax has somewhere to flow.
     await broker.wallet("__broker__").topup(0.0, reason="init")
     await broker.wallet("__commons__").topup(50.0, reason="init commons pool")
@@ -537,18 +799,32 @@ async def run_debate(
         wallet_owners = [
             str(human), org, "__broker__", "__commons__",
         ] + [str(a.address) for a in spawn.new]
+        if secondary_server_meta is not None:
+            wallet_owners.append(secondary_server_meta.server_id)
         for owner in wallet_owners:
             state = await broker.wallet(owner).get_state()
             result.wallets[owner] = round(state.balance, 6)
-        result.server_meta = {
-            "server_id": server_meta.server_id,
-            "org": server_meta.org,
-            "base_rate": server_meta.base_rate,
-            "compute_binding": server_meta.compute_binding,
-            "supported_tiers": list(server_meta.supported_tiers),
-            "specialties": list(server_meta.specialties),
-            "integrations": list(server_meta.integrations),
-        }
+
+        def _server_to_dict(m: Any) -> dict[str, Any]:
+            return {
+                "server_id": m.server_id,
+                "org": m.org,
+                "operator": m.operator,
+                "base_rate": m.base_rate,
+                "compute_binding": m.compute_binding,
+                "compute_ranking": m.compute_ranking,
+                "supported_tiers": list(m.supported_tiers),
+                "specialties": list(m.specialties),
+                "integrations": list(m.integrations),
+            }
+
+        # Back-compat single-server field for older templates.
+        result.server_meta = _server_to_dict(server_meta)
+        # New: full list of servers visible to the broker right now.
+        result.servers = [_server_to_dict(server_meta)]
+        if secondary_server_meta is not None:
+            result.servers.append(_server_to_dict(secondary_server_meta))
+
         leaves = await broker.compute.list_leaves(only_alive_providers=False)
         result.compute_menu = [{
             "address": l.address,
@@ -560,6 +836,10 @@ async def run_debate(
             "capacity": l.capacity,
             "healthy": l.healthy,
         } for l in leaves]
+        # Settlements observed during the run — one entry per response
+        # that settled cleanly through the broker (SEND-GET and
+        # CAST-GET both contribute).
+        result.settlements = list(getattr(broker, "settlements", []))
     except Exception:
         log.exception("economy snapshot failed; transcripts unaffected")
 

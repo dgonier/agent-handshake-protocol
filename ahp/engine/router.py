@@ -330,9 +330,194 @@ class ProtocolEngine:
         targets = await self._resolve_for_broadcast(message)
         if not targets:
             return []
-        return await self.bus.cast_get(
-            message, targets, timeout=timeout, max_responses=max_responses,
+        if self.broker is None:
+            return await self.bus.cast_get(
+                message, targets,
+                timeout=timeout, max_responses=max_responses,
+            )
+        return await self._broker_cast_get(
+            message, targets=targets,
+            timeout=timeout, max_responses=max_responses,
         )
+
+    async def _broker_cast_get(
+        self,
+        message: Message,
+        *,
+        targets: list[AgentAddress],
+        timeout: float,
+        max_responses: int | None,
+    ) -> list[Message]:
+        """CAST-GET with per-target hold + per-response settlement.
+
+        One hold per resolved target — each can settle or refund
+        independently. Targets that don't respond by ``timeout`` have
+        their hold refunded; responders settle exactly like the SEND-GET
+        path would.
+
+        Insufficient-funds behavior: each per-target hold is attempted
+        independently; targets whose hold can't be placed are dropped
+        from the broadcast. This is the right tradeoff for adversarial
+        debates where the caller has finite credits — a partial
+        broadcast is preferable to a thrown exception that loses every
+        response.
+        """
+        from ahp.economy.compute_provider import best_leaf
+        from ahp.economy.pricing import estimate_hold
+        from ahp.economy.wallet import InsufficientFundsError
+
+        prompt_chars = len(str(message.body)) if message.body is not None else 0
+        max_resp = DEFAULT_EXPECTED_RESPONSE_CHARS
+        if isinstance(message.body, dict):
+            try:
+                max_resp = int(message.body.get(
+                    "max_response_chars", DEFAULT_EXPECTED_RESPONSE_CHARS,
+                ))
+            except (TypeError, ValueError):
+                pass
+
+        caller_wallet_owner = str(message.source)
+
+        # Pre-cache server + leaf decisions per org so two agents from
+        # the same org don't trigger duplicate broker scans.
+        owning_servers = await self.broker.servers.discover(alive_only=True)
+        servers_by_org: dict[str, Any] = {s.org: s for s in owning_servers}
+        leaves = await self.broker.compute.list_leaves(only_alive_providers=True)
+        leaf_by_server_id: dict[str, Any] = {}
+
+        # Per-target context: hold_id, server, leaf. Targets that fail
+        # the hold (no server, or insufficient funds) are pruned from
+        # the broadcast.
+        held: dict[AgentAddress, dict[str, Any]] = {}
+        deliverable_targets: list[AgentAddress] = []
+        for target in targets:
+            owning_server = servers_by_org.get(target.org)
+            if owning_server is None:
+                # No owning server: fall back to free dispatch (the
+                # no-broker behavior) — agent is in the network but
+                # nobody is billing for it.
+                deliverable_targets.append(target)
+                continue
+            if owning_server.server_id not in leaf_by_server_id:
+                leaf_by_server_id[owning_server.server_id] = best_leaf(
+                    owning_server.compute_binding,
+                    leaves,
+                    rank_by=owning_server.compute_ranking,  # type: ignore[arg-type]
+                )
+            chosen_leaf = leaf_by_server_id[owning_server.server_id]
+            hold = estimate_hold(
+                base_rate=owning_server.base_rate,
+                tier="small",
+                prompt_chars=prompt_chars,
+                max_response_chars=max_resp,
+                leaf_rate_per_1k_chars=(
+                    chosen_leaf.rate_per_1k_chars if chosen_leaf else 0.0
+                ),
+            )
+            hold_id = f"msg:{message.message_id}:t:{target}"
+            try:
+                await self.broker.hold(
+                    caller=caller_wallet_owner,
+                    amount=hold.amount,
+                    hold_id=hold_id,
+                    reason=f"cast_get to {target}",
+                )
+            except InsufficientFundsError:
+                log.warning(
+                    "broker: %s out of funds for %s mid-broadcast — skipping",
+                    caller_wallet_owner, target,
+                )
+                continue
+            held[target] = {
+                "hold_id": hold_id,
+                "server": owning_server,
+                "leaf": chosen_leaf,
+            }
+            deliverable_targets.append(target)
+
+        if not deliverable_targets:
+            # Nothing to send. Any held entries would already be empty
+            # since no targets cleared the hold step.
+            return []
+
+        # Dispatch.
+        import time as _time
+        dispatch_started = _time.monotonic()
+        try:
+            responses = await self.bus.cast_get(
+                message, deliverable_targets,
+                timeout=timeout, max_responses=max_responses,
+            )
+        except Exception:
+            # Bus error: refund every hold we placed.
+            for ctx in held.values():
+                try:
+                    await self.broker.refund(
+                        caller=caller_wallet_owner,
+                        hold_id=ctx["hold_id"],
+                        reason="cast_get dispatch raised",
+                    )
+                except Exception:
+                    pass
+            raise
+
+        # Settle each response against the right per-target hold.
+        responded: set[str] = set()
+        for response in responses:
+            source_str = str(response.source)
+            if source_str in responded:
+                continue  # one settlement per responder
+            responded.add(source_str)
+            ctx = held.get(response.source)
+            if ctx is None:
+                # A response from a target we didn't hold against (e.g.
+                # a no-owning-server target). No settlement — the
+                # message was a freebie.
+                continue
+            latency_ms = (_time.monotonic() - dispatch_started) * 1000.0
+            response_chars = (
+                len(str(response.body)) if response.body is not None else 0
+            )
+            try:
+                await self.broker.calculate_and_settle(
+                    caller=caller_wallet_owner,
+                    hold_id=ctx["hold_id"],
+                    server=ctx["server"],
+                    leaf=ctx["leaf"],
+                    response_chars=response_chars,
+                    max_response_chars=max_resp,
+                    actual_latency_ms=latency_ms,
+                    completed_with_caller=0,
+                    tier_verdict="matched",
+                )
+            except Exception:
+                log.exception(
+                    "cast_get settlement failed for %s; refunding hold",
+                    response.source,
+                )
+                try:
+                    await self.broker.refund(
+                        caller=caller_wallet_owner,
+                        hold_id=ctx["hold_id"],
+                        reason="settlement raised",
+                    )
+                except Exception:
+                    pass
+
+        # Refund holds for targets that didn't respond.
+        for target, ctx in held.items():
+            if str(target) in responded:
+                continue
+            try:
+                await self.broker.refund(
+                    caller=caller_wallet_owner,
+                    hold_id=ctx["hold_id"],
+                    reason="no response (cast_get timeout or target silent)",
+                )
+            except Exception:
+                pass
+
+        return responses
 
     async def _handle_cast_sub(self, message: Message) -> Subscription:
         """Open a long-lived subscription on the bus's tap channel.

@@ -22,6 +22,7 @@ Liveness:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import asdict
@@ -33,6 +34,15 @@ from ahp.economy.tiers import parse_tier
 
 PROVIDER_HASH_KEY = "ahp:compute_provider"
 PROVIDER_ALIVE_KEY = "ahp:compute_provider:alive:{provider_id}"
+PROVIDER_LAST_SEEN_KEY = "ahp:compute_provider:last_seen:{provider_id}"
+"""Sentinel that records a provider was once proven-alive.
+
+Set on every successful heartbeat (including the implicit
+registration-as-heartbeat case). Has NO TTL — it persists across
+heartbeat expiries so the outage detector can tell "was this provider
+just briefly visible and then quietly disappeared?" (planned shutdown
+clears it; absent-without-clear = unplanned outage).
+"""
 MENU_LEAF_KEY = "ahp:compute_menu:{address}"
 MENU_LEAF_INDEX = "ahp:compute_menu:index"
 """SET of all live MenuLeaf addresses, kept in sync with the per-leaf keys.
@@ -63,18 +73,54 @@ class ComputeProviderRegistry:
 
     # ── providers ──────────────────────────────────────────────────────
 
-    async def register_provider(self, provider: ComputeProvider) -> None:
+    async def register_provider(
+        self,
+        provider: ComputeProvider,
+        *,
+        prove_alive: bool = True,
+    ) -> None:
+        """Persist a provider's metadata.
+
+        When ``prove_alive=True`` (the default and the natural case for
+        self-hosted providers whose registration *is* their first
+        heartbeat), the provider is also marked alive — its leaves
+        become visible to ``list_leaves(only_alive_providers=True)``
+        immediately.
+
+        When ``prove_alive=False`` (e.g. metadata-only registration of
+        a remote provider whose endpoint hasn't been pinged yet), the
+        provider is recorded but its leaves stay invisible until an
+        explicit ``heartbeat_provider`` call. Health must be proven.
+        """
         payload = json.dumps(asdict(provider))
         await self._redis.hset(PROVIDER_HASH_KEY, provider.provider_id, payload)
-        await self._mark_alive(provider.provider_id)
+        if prove_alive:
+            await self._mark_alive(provider.provider_id)
 
-    async def deregister_provider(self, provider_id: str) -> None:
-        # Cascade: drop the provider's leaves too.
+    async def deregister_provider(
+        self,
+        provider_id: str,
+        *,
+        graceful: bool = True,
+    ) -> None:
+        """Remove a provider and cascade-drop its leaves.
+
+        ``graceful=True`` clears the last-seen sentinel so the outage
+        detector treats this as a clean shutdown. ``graceful=False``
+        leaves the sentinel in place — the next outage scan will see
+        "provider disappeared without saying goodbye" and credit a
+        reputation hit. Use ``graceful=False`` from a watchdog that has
+        decided this provider is broken.
+        """
         leaves = await self.menu_for_provider(provider_id)
         for leaf in leaves:
             await self.deregister_leaf(leaf.address)
         await self._redis.hdel(PROVIDER_HASH_KEY, provider_id)
         await self._redis.delete(PROVIDER_ALIVE_KEY.format(provider_id=provider_id))
+        if graceful:
+            await self._redis.delete(
+                PROVIDER_LAST_SEEN_KEY.format(provider_id=provider_id)
+            )
 
     async def heartbeat_provider(self, provider_id: str) -> bool:
         exists = await self._redis.hexists(PROVIDER_HASH_KEY, provider_id)
@@ -82,6 +128,29 @@ class ComputeProviderRegistry:
             return False
         await self._mark_alive(provider_id)
         return True
+
+    async def detect_outage(self, provider_id: str) -> bool:
+        """Return True iff this provider has had an unplanned outage
+        since its last detected state — i.e., it was once proven alive
+        (last-seen sentinel present) but the heartbeat TTL has expired.
+
+        Calling this method also *clears* the sentinel on detection,
+        so a single outage is only reported once. Callers (the broker)
+        should fold the True case into the provider's reputation via
+        ``record_outcome(provider_id, "timeout")`` or similar.
+        """
+        last_seen_key = PROVIDER_LAST_SEEN_KEY.format(provider_id=provider_id)
+        alive_key = PROVIDER_ALIVE_KEY.format(provider_id=provider_id)
+        seen, alive = await asyncio.gather(
+            self._redis.exists(last_seen_key),
+            self._redis.exists(alive_key),
+        )
+        if seen and not alive:
+            # Outage: was alive, no longer is, no graceful deregister.
+            # Clear the sentinel so we don't double-count.
+            await self._redis.delete(last_seen_key)
+            return True
+        return False
 
     async def get_provider(self, provider_id: str) -> ComputeProvider | None:
         raw = await self._redis.hget(PROVIDER_HASH_KEY, provider_id)
@@ -177,6 +246,13 @@ class ComputeProviderRegistry:
         await self._redis.set(
             PROVIDER_ALIVE_KEY.format(provider_id=provider_id), "1",
             ex=self._ttl,
+        )
+        # Sentinel for outage detection: written once per heartbeat,
+        # cleared only on graceful deregister or after an outage has
+        # been counted.
+        await self._redis.set(
+            PROVIDER_LAST_SEEN_KEY.format(provider_id=provider_id),
+            str(int(time.time())),
         )
 
     async def _scan_providers(self) -> AsyncIterator[ComputeProvider]:
