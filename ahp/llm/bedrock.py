@@ -74,9 +74,9 @@ def bedrock_chat_model(
 ):
     """Construct a cached ``ChatBedrockConverse`` for the given model/region.
 
-    Returns a LangChain-compatible chat model that ``create_react_agent``
-    and ``LangGraphAgent`` can consume directly. Cached so repeat calls
-    in the same process reuse the underlying client.
+    Returns a LangChain-compatible chat model that ``create_agent``
+    (and ``LangGraphAgent``) can consume directly. Cached so repeat
+    calls in the same process reuse the underlying client.
     """
     from langchain_aws import ChatBedrockConverse  # type: ignore[import-not-found]
 

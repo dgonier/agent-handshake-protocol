@@ -446,13 +446,9 @@ class SessionAgent(AHPAgent):
 
         # Build a per-call agent. The graph is cheap to construct and
         # we want the cleanest possible state per turn.
+        from langchain.agents import create_agent
         lc_tools = [_to_langchain_tool(t) for t in self._tools]
-        try:
-            from langchain.agents import create_agent  # v1
-            graph = create_agent(model=self._model, tools=lc_tools)
-        except ImportError:
-            from langgraph.prebuilt import create_react_agent  # legacy
-            graph = create_react_agent(self._model, lc_tools)
+        graph = create_agent(model=self._model, tools=lc_tools)
 
         from langchain_core.messages import HumanMessage
         state = await graph.ainvoke({"messages": [HumanMessage(content=prompt)]})
