@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}Economy · AHP{% endblock %}
+
+{% block content %}
+<h1>Economy</h1>
+<p class="meta">
+  Wallets, server directory, and compute menu captured at the end of
+  the most recent session. The protocol settles every dispatch through
+  the broker: caller's wallet is debited the formula's pre-tax amount;
+  receiving agent, broker, commons, and compute provider split the
+  payout.
+</p>
+
+{% if not result %}
+  <p class="empty">No run yet. Visit <a href="/" style="color: var(--accent);">Debate</a> to kick one off.</p>
+{% else %}
+
+  <h2>Wallets ({{ result.wallets|length }})</h2>
+  <p class="meta">Balances at end-of-run, in credits.</p>
+  <div class="card scroll-x">
+    <table>
+      <thead>
+        <tr>
+          <th>Owner</th>
+          <th style="text-align: right;">Balance</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for owner, balance in result.wallets.items() %}
+          <tr>
+            <td class="mono">{{ owner }}</td>
+            <td style="text-align: right;">
+              <code>{{ "%.4f"|format(balance) }}</code>
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if result.server_meta %}
+    <h2>Server</h2>
+    <p class="meta">Self-hosted server registered with the broker for this run.</p>
+    <div class="card">
+      <div><strong>id:</strong> <code>{{ result.server_meta.server_id }}</code></div>
+      <div><strong>org:</strong> <code>{{ result.server_meta.org }}</code></div>
+      <div><strong>base_rate:</strong> <code>{{ result.server_meta.base_rate }}</code> credits/char/tier-unit</div>
+      <div><strong>compute_binding:</strong> <code>{{ result.server_meta.compute_binding }}</code></div>
+      <div><strong>supported_tiers:</strong> <code>{{ result.server_meta.supported_tiers|join(", ") }}</code></div>
+    </div>
+  {% endif %}
+
+  {% if result.compute_menu %}
+    <h2>Compute menu ({{ result.compute_menu|length }})</h2>
+    <p class="meta">Menu leaves registered by the compute provider.</p>
+    <div class="card scroll-x">
+      <table>
+        <thead>
+          <tr>
+            <th>provider.tier.model</th>
+            <th>rate / 1k chars</th>
+            <th>latency p95</th>
+            <th>capacity</th>
+            <th>healthy</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for leaf in result.compute_menu %}
+            <tr>
+              <td class="mono">{{ leaf.address }}</td>
+              <td><code>{{ leaf.rate_per_1k_chars }}</code></td>
+              <td><code>{{ leaf.latency_p95_ms }}ms</code></td>
+              <td><code>{{ "%.2f"|format(leaf.capacity) }}</code></td>
+              <td>
+                {% if leaf.healthy %}
+                  <span class="pill ok">yes</span>
+                {% else %}
+                  <span class="pill bad">no</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+
+  <h2>How it works</h2>
+  <div class="card">
+    <p style="margin-top: 0;">
+      Every <code>SEND-GET</code> dispatch routes through the broker.
+      Before the bus delivers the message, the broker:
+    </p>
+    <ol style="margin: 0; padding-left: 20px;">
+      <li>Looks up the target agent's owning server (matched by <code>org</code>).</li>
+      <li>Resolves the server's <code>compute_binding</code> pattern against
+          the live menu, picks the highest-ranked leaf.</li>
+      <li>Estimates the call cost with the conservative-multiplier
+          <code>estimate_hold</code> and places that hold on the
+          caller's wallet.</li>
+      <li>If the caller doesn't have funds, dispatch is rejected.</li>
+    </ol>
+    <p>
+      After the response lands the broker settles atomically: caller's
+      hold is released and debited by the actual <code>pre_tax</code>;
+      receiving agent gets the server residual, compute provider gets
+      its slice (zero for self-hosted), broker gets 60% of the 5% tax,
+      commons gets 40%.
+    </p>
+    <p style="margin-bottom: 0;">
+      Reputation updates after every settlement based on the caller's
+      verdict and the response latency. Routing visibility caps fresh
+      servers below full participation until they've completed enough
+      calls.
+    </p>
+  </div>
+{% endif %}
+{% endblock %}

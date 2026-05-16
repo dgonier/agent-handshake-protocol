@@ -32,6 +32,7 @@ from typing import Any
 
 from ahp.audit import AuditEvent, AuditSink
 from ahp.core.address import AgentAddress
+from ahp.economy.pricing import DEFAULT_EXPECTED_RESPONSE_CHARS
 from ahp.core.codes import Code
 from ahp.core.compatibility import CompatibilityMatrix
 from ahp.core.message import Message
@@ -70,6 +71,7 @@ class ProtocolEngine:
         groups: Any = None,
         scope: ScopePolicy | None = None,
         audit: AuditSink | None = None,
+        broker: Any = None,
     ) -> None:
         self.bus = bus
         self.registry = registry
@@ -86,6 +88,12 @@ class ProtocolEngine:
         self.scope = scope
         # Optional audit sink for dispatch outcomes.
         self.audit = audit
+        # Optional broker for the economic plane. When None, the engine
+        # dispatches without any wallet / settlement work — preserves
+        # backward compatibility with existing demos that haven't yet
+        # opted into the economy. When present, SEND-GET runs the full
+        # hold-and-settle pipeline.
+        self.broker = broker
 
     # ── entry point ─────────────────────────────────────────────────────
 
@@ -158,9 +166,152 @@ class ProtocolEngine:
         if not await self.registry.is_alive(target):
             return None
 
-        response = await self.bus.send_get(message, timeout=timeout)
+        # Economic plane: if a broker is wired, run hold → dispatch →
+        # settle. Otherwise pass through to the bus directly. The
+        # broker path uses the message's source and target as the two
+        # wallet endpoints (agent-to-agent settlement); compute slice
+        # is paid based on whatever leaf the target's owning server
+        # has registered (or None for self-hosted).
+        if self.broker is None:
+            response = await self.bus.send_get(message, timeout=timeout)
+        else:
+            response = await self._broker_send_get(
+                message, target=target, timeout=timeout,
+            )
+
         if response is not None:
             await self.cache.put(message, response)
+        return response
+
+    async def _broker_send_get(
+        self,
+        message: Message,
+        *,
+        target: AgentAddress,
+        timeout: float,
+    ) -> Message | None:
+        """SEND-GET with full economic settlement around the dispatch."""
+        from ahp.economy.wallet import InsufficientFundsError
+
+        prompt_chars = len(str(message.body)) if message.body is not None else 0
+        # Conservative max-response estimate when caller didn't specify;
+        # recipes in the runner do pass max_response_chars in the body,
+        # so prefer that when present.
+        max_resp = DEFAULT_EXPECTED_RESPONSE_CHARS
+        if isinstance(message.body, dict):
+            try:
+                max_resp = int(message.body.get(
+                    "max_response_chars", DEFAULT_EXPECTED_RESPONSE_CHARS,
+                ))
+            except (TypeError, ValueError):
+                pass
+
+        # Best-effort target tier: derive from accept set. A target
+        # accepting only 's' is treated as small; otherwise default to
+        # small. Tier is a routing input to the broker; the actual
+        # model selection is the responding server's concern.
+        tier = "small"
+
+        # Look up the target's owning server. Convention: the server
+        # whose org == target.org. If no such server exists, we still
+        # dispatch — broker bills against the agent directly.
+        owning_servers = await self.broker.servers.discover(alive_only=True)
+        owning_server = next(
+            (s for s in owning_servers if s.org == target.org), None,
+        )
+        if owning_server is None:
+            # No registered server. Skip economic settlement; dispatch
+            # raw. (This matches the no-broker pass-through.)
+            return await self.bus.send_get(message, timeout=timeout)
+
+        # Look up the compute leaf this server is bound to.
+        leaves = await self.broker.compute.list_leaves(
+            only_alive_providers=True,
+        )
+        from ahp.economy.compute_provider import best_leaf
+        chosen_leaf = best_leaf(
+            owning_server.compute_binding,
+            leaves,
+            rank_by=owning_server.compute_ranking,  # type: ignore[arg-type]
+        )
+
+        # Estimate the hold using the formula's hold estimator.
+        from ahp.economy.pricing import estimate_hold
+        hold = estimate_hold(
+            base_rate=owning_server.base_rate,
+            tier=tier,
+            prompt_chars=prompt_chars,
+            max_response_chars=max_resp,
+            leaf_rate_per_1k_chars=(
+                chosen_leaf.rate_per_1k_chars if chosen_leaf else 0.0
+            ),
+        )
+
+        caller_wallet_owner = str(message.source)
+        hold_id = f"msg:{message.message_id}"
+        try:
+            await self.broker.hold(
+                caller=caller_wallet_owner,
+                amount=hold.amount,
+                hold_id=hold_id,
+                reason=f"send_get to {target}",
+            )
+        except InsufficientFundsError:
+            log.warning(
+                "broker: %s has insufficient funds to call %s (need %.4f)",
+                caller_wallet_owner, target, hold.amount,
+            )
+            return None
+
+        # Dispatch over the bus, with hold in place.
+        import time as _time
+        dispatch_started = _time.monotonic()
+        try:
+            response = await self.bus.send_get(message, timeout=timeout)
+        except Exception:
+            await self.broker.refund(
+                caller=caller_wallet_owner, hold_id=hold_id,
+                reason="dispatch exception",
+            )
+            raise
+
+        if response is None:
+            # Timeout or no live target — refund the hold.
+            await self.broker.refund(
+                caller=caller_wallet_owner, hold_id=hold_id,
+                reason="no response (timeout or target dead)",
+            )
+            return None
+
+        # Settle. The responding agent earns; their owning server's
+        # bound compute leaf gets the compute slice; tax flows to
+        # broker + commons.
+        latency_ms = (_time.monotonic() - dispatch_started) * 1000.0
+        response_chars = (
+            len(str(response.body)) if response.body is not None else 0
+        )
+        try:
+            await self.broker.calculate_and_settle(
+                caller=caller_wallet_owner,
+                hold_id=hold_id,
+                server=owning_server,
+                leaf=chosen_leaf,
+                response_chars=response_chars,
+                max_response_chars=max_resp,
+                actual_latency_ms=latency_ms,
+                completed_with_caller=0,  # TODO: track per-pair counts
+                tier_verdict="matched",
+            )
+        except Exception:
+            log.exception("broker settlement failed; refunding hold")
+            try:
+                await self.broker.refund(
+                    caller=caller_wallet_owner, hold_id=hold_id,
+                    reason="settlement raised",
+                )
+            except Exception:
+                pass
+
         return response
 
     async def _handle_cast(self, message: Message) -> int:

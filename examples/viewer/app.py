@@ -209,6 +209,9 @@ def _load_run(run_id: str) -> DebateResult | None:
     data.setdefault("org", "tifin")
     data.setdefault("format", "debate")
     data.setdefault("elapsed_closing", 0.0)
+    data.setdefault("wallets", {})
+    data.setdefault("server_meta", {})
+    data.setdefault("compute_menu", [])
     return DebateResult(**data)
 
 
@@ -390,6 +393,32 @@ async def run_detail(request: Request, run_id: str):
         "running_for": 0,
     }
     return templates.TemplateResponse(request, "debate.html", ctx)
+
+
+@app.get("/economy", response_class=HTMLResponse)
+async def economy(request: Request):
+    """Economy panel: wallets, server directory, compute menu.
+
+    For the v1 viewer this surfaces the *most recent run's* snapshot
+    (the runner captures wallet balances at end-of-run). A future
+    iteration could maintain live wallet state via a persistent
+    Redis connection — useful but not required for the demo loop.
+    """
+    ctx = _common_ctx() | {"page": "economy", "result": state.latest}
+    return templates.TemplateResponse(request, "economy.html", ctx)
+
+
+@app.get("/api/economy")
+async def api_economy():
+    if state.latest is None:
+        return JSONResponse(
+            {"wallets": {}, "server_meta": {}, "compute_menu": []},
+        )
+    return {
+        "wallets": state.latest.wallets,
+        "server_meta": state.latest.server_meta,
+        "compute_menu": state.latest.compute_menu,
+    }
 
 
 @app.get("/api/latest")

@@ -17,10 +17,14 @@ interview vs. fiction — it just orchestrates rounds against the
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
+
+
+log = logging.getLogger("ahp.viewer.runner")
 
 from ahp.adapters import (
     AgentFactory,
@@ -42,6 +46,26 @@ from ahp.llm.bedrock import bedrock_chat_model
 from ahp.registry.registry import AgentRegistry
 from ahp.transport.cache import ProtocolCache
 from ahp.transport.redis_bus import RedisBus
+
+
+# ── helpers ──────────────────────────────────────────────────────────
+
+
+def _model_short(model_id: str) -> str:
+    """Slugify a Bedrock model id for use in a MenuLeaf address.
+
+    Bedrock inference profile ids contain colons and version suffixes
+    that aren't valid in our menu-leaf address validator. Trim to the
+    last segment and drop anything past a colon.
+    """
+    tail = model_id.split(".")[-1].split(":")[0]
+    # MenuLeaf model validator: lowercase, kebab/dot/underscore.
+    # Strip anything else.
+    cleaned = "".join(
+        c if (c.isalnum() or c in "-_.") else "-"
+        for c in tail.lower()
+    )
+    return cleaned or "model"
 
 
 # ── result types ──────────────────────────────────────────────────────
@@ -87,6 +111,10 @@ class DebateResult:
     elapsed_round1: float = 0.0
     elapsed_round2: float = 0.0
     elapsed_closing: float = 0.0
+    # Economy snapshot — captured at end-of-run.
+    wallets: dict[str, float] = field(default_factory=dict)
+    server_meta: dict[str, Any] = field(default_factory=dict)
+    compute_menu: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -321,9 +349,41 @@ async def run_debate(
     bus = RedisBus(redis)
     registry = AgentRegistry(redis, heartbeat_ttl=120, audit=audit)
     cache = ProtocolCache(redis)
+
+    # Stand up a broker and register a self-hosted server for the
+    # current run. The server's id matches the request's ``org`` so
+    # the engine's broker path can find it when settling.
+    from ahp.broker import Broker, ServerMeta
+    from ahp.economy.compute_provider import ComputeProvider, MenuLeaf
+    from ahp.economy.reputation import ReputationEntry, VISIBILITY_FULL_AT
+    broker = Broker(redis)
+    server_meta = ServerMeta(
+        server_id=org,
+        org=org,
+        operator="viewer-runner",
+        base_rate=0.0002,
+        compute_binding=f"{org}.small.{_model_short(model_id)}",
+        supported_tiers=["small", "medium"],
+    )
+    await broker.register_server(server_meta)
+    await broker.register_compute_provider(ComputeProvider(provider_id=org))
+    await broker.register_leaf(MenuLeaf(
+        provider_id=org, tier="small", model=_model_short(model_id),
+        rate_per_1k_chars=0.0,  # self-hosted: compute slice returns to the server
+        latency_p95_ms=600.0, capacity=1.0,
+    ))
+    # Give the demo server an established reputation so the visibility
+    # coin-flip doesn't filter it out on the first call.
+    await broker.set_reputation(ReputationEntry(
+        owner=org, reputation=0.9, completed_accepted=VISIBILITY_FULL_AT,
+    ))
+    # Seed the broker + commons wallets so the tax has somewhere to flow.
+    await broker.wallet("__broker__").topup(0.0, reason="init")
+    await broker.wallet("__commons__").topup(50.0, reason="init commons pool")
+
     engine = ProtocolEngine(
         bus, registry, cache, CompatibilityMatrix(),
-        default_timeout=90.0, audit=audit,
+        default_timeout=90.0, audit=audit, broker=broker,
     )
 
     slm_model = bedrock_chat_model(
@@ -341,6 +401,16 @@ async def run_debate(
         engine, capabilities=CapabilityRegistry(),
         tools=DEFAULT_TOOL_REGISTRY,
         slm=slm_model,
+        host_server_id=org,
+        fund_agents=True,
+    )
+    # Top up the host server's wallet so it can fund the agents it
+    # provisions. Without this, the banker would fail on the first
+    # session-agent it tries to seed.
+    from ahp.economy.agent_banker import STARTING_FUND_BY_LIFECYCLE
+    await broker.wallet(org).topup(
+        STARTING_FUND_BY_LIFECYCLE["session"] * (effective_count + 1),
+        reason="seed host server for provisioning",
     )
     factory.register(
         AddressPattern.parse(f"*.{fmt.role}.{domain}.{subdomain}.*.*.*"),
@@ -365,6 +435,12 @@ async def run_debate(
         f"you.{fmt.role}.{domain}.{subdomain}.s.session.moderator"
     )
     await registry.register(human)
+    # The moderator pays for every CAST-GET round; seed its wallet
+    # generously so the demo never goes broke. Tax flows out of these
+    # credits to broker + commons.
+    await broker.wallet(str(human)).topup(
+        100.0, reason="seed moderator wallet for demo",
+    )
 
     pattern = AddressPattern.parse(
         f"*.{fmt.role}.{domain}.{subdomain}.*.*.*"
@@ -455,6 +531,37 @@ async def run_debate(
     # Capture audit transcript.
     result.audit_events = [_event_to_dict(e) for e in mem_sink.events]
     result.finished_at = time.time()
+
+    # Capture an economy snapshot for the viewer to render.
+    try:
+        wallet_owners = [
+            str(human), org, "__broker__", "__commons__",
+        ] + [str(a.address) for a in spawn.new]
+        for owner in wallet_owners:
+            state = await broker.wallet(owner).get_state()
+            result.wallets[owner] = round(state.balance, 6)
+        result.server_meta = {
+            "server_id": server_meta.server_id,
+            "org": server_meta.org,
+            "base_rate": server_meta.base_rate,
+            "compute_binding": server_meta.compute_binding,
+            "supported_tiers": list(server_meta.supported_tiers),
+            "specialties": list(server_meta.specialties),
+            "integrations": list(server_meta.integrations),
+        }
+        leaves = await broker.compute.list_leaves(only_alive_providers=False)
+        result.compute_menu = [{
+            "address": l.address,
+            "provider": l.provider_id,
+            "tier": l.tier,
+            "model": l.model,
+            "rate_per_1k_chars": l.rate_per_1k_chars,
+            "latency_p95_ms": l.latency_p95_ms,
+            "capacity": l.capacity,
+            "healthy": l.healthy,
+        } for l in leaves]
+    except Exception:
+        log.exception("economy snapshot failed; transcripts unaffected")
 
     # Teardown.
     for agent in spawn.new:

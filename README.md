@@ -1,17 +1,260 @@
 # AHP — Agentic Handshake Protocol
 
-A typed, addressable, format-aware messaging protocol for heterogeneous
-agents. Agents are identified by structured URIs, exchange messages
-tagged with hierarchical interaction codes, and negotiate payload format
-through a single shared compatibility matrix.
+> A typed protocol for talking to N AI agents at once — the same way every time.
 
-All five phases of the plan are implemented: core primitives, Redis
-transport, cache, registry, the protocol engine + thread manager, the
-framework adapter layer (LangGraph, DSPy, deep agent, human) with
-factory, provisioning patterns, and a capability registry, plus a
-runnable end-to-end demo.
+If you've built more than one multi-agent system you've probably written
+this code three times:
+
+* **Addressing.** Every project invents its own way to name agents and
+  then can't broadcast generically. `bull_agent`, `bear_agent`,
+  `data_agent` — fine for two agents, miserable for fifty.
+* **Format negotiation.** Some agents speak strings, some JSON, some
+  bytes, some embeddings. The first integration is a switch statement;
+  the tenth is an unmaintainable rats' nest of glue.
+* **Orchestration.** Every debate, interview, panel, or critique loop
+  is a one-off script. Adding a new dialog shape means rewriting the
+  controller from scratch.
+
+**AHP solves these three problems together with a small Redis-backed
+library.** Agents have structured URI addresses. Messages carry a
+hierarchical interaction code and a payload-tier set. Dialog patterns
+— debate, interview, deliberation, brainstorm — are *recipes* defined
+once and reused across topics. An SLM-driven `AgentFactory` picks the
+panel from a domain + topic; a `ProtocolEngine` routes everything
+through a single matrix.
+
+`ahp.core` has zero runtime dependencies. Everything else (transport,
+framework adapters, web search, audit) is opt-in.
+
+## In 30 lines
+
+```python
+import asyncio
+from ahp.adapters import AgentFactory, CapabilityRegistry
+from ahp.adapters.formats import get_format
+from ahp.core import AgentAddress, AddressPattern, Message
+from ahp.engine.router import ProtocolEngine
+from ahp.llm.bedrock import bedrock_chat_model
+from ahp.registry.registry import AgentRegistry
+from ahp.transport.cache import ProtocolCache
+from ahp.transport.redis_bus import RedisBus
+import fakeredis.aioredis
+
+async def main():
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    bus, reg, cache = RedisBus(redis), AgentRegistry(redis), ProtocolCache(redis)
+    engine = ProtocolEngine(bus, reg, cache)
+
+    slm = bedrock_chat_model()  # picks Haiku 4.5 by default
+    factory = AgentFactory(engine, capabilities=CapabilityRegistry(), slm=slm)
+
+    # The SLM picks 4 cosmology perspectives appropriate to the topic.
+    spawn = await factory.invite_and_start(
+        org="public", role="adversarial",
+        domain="science", subdomain="astrophysics",
+        topic="What caused the Big Bang?", count=4,
+    )
+
+    # Broadcast: every agent argues its position in 3 sentences.
+    pattern = AddressPattern.parse("*.adversarial.science.astrophysics.*.*.*")
+    msg = Message(source=AgentAddress.parse("you.adversarial.science.astrophysics.s.session.you"),
+                  target=pattern, code="adversarial.debate", verb="CAST-GET",
+                  body={"recipe": "adversarial:debate-me", "question": "What caused the Big Bang?"})
+    replies = await engine.handle(msg, max_responses=4)
+    for r in replies:
+        print(r.source.instance, "→", r.body["text"][:120])
+
+asyncio.run(main())
+```
+
+That snippet covers: addressing, an SLM-picked panel, a pattern-routed
+broadcast, a reusable recipe, and a typed response. Same code can run
+`interview-yall`, `collaborate-brainstorm`, `fiction-theatre`, or any
+of the 16 built-in formats by swapping one string.
+
+## What you get
+
+* **A 7-field URI address space** for agents. Wildcards + payload-tier
+  subset semantics mean one pattern can fan out to a hundred targets,
+  filtered by what they actually understand.
+* **51 dialog recipes across 11 interaction roles** (debate, interview
+  variants, collaboration, conversation, fiction, deliberation,
+  teaching, estimation, interrogation). Each recipe is a 5-line render
+  function — extend with your own as easily as you write a Python
+  function.
+* **16 prebuilt session formats** that compose recipes into
+  opening/middle/closing rounds. `debate`, `interview-me`,
+  `interview-yall`, `collaborate-brainstorm`, `fiction-theatre`,
+  `teach`, `estimate`, … swap them by name.
+* **`AgentFactory` with an SLM**: hand it a domain + topic and it
+  populates a panel with appropriate personas. No hard-coded prompts
+  to maintain across topics.
+* **A global tool registry** that any agent can use. `search_tavily`
+  ships in `ahp.tools.research`; the LLM (LangChain `create_agent`)
+  decides when to call it.
+* **Audit + observability**: every protocol op emits a typed
+  `AuditEvent`. Sinks ship for in-memory, stdlib logging, and
+  CloudWatch Logs.
+* **Adapters for LangGraph, DSPy, deepagents** (≥0.6), and a
+  human-in-the-loop primitive. MCP servers can be mounted under any
+  scope.
+* **A FastAPI + Docker Compose viewer** under `examples/viewer/` —
+  mobile-first browser UI that runs the live stack against your AWS
+  Bedrock credentials.
+
+## Show me
+
+The viewer is one command:
+
+```bash
+docker compose up --build         # http://localhost:9876
+# optional public URL via Cloudflare quick-tunnel:
+docker compose --profile tunnel up
+```
+
+Pick a topic, a format, a domain/subdomain, hit Run. The page shows
+the SLM-picked panel, every round, and which tools each agent called.
+Full instructions in [`examples/viewer/README.md`](examples/viewer/README.md).
+
+## Concepts in 5 minutes
+
+**Address.** Every agent is a 7-field URI:
+
+```
+{org}.{role}.{domain}.{subdomain}.{accept}.{lifecycle}.{instance}?{params}
+```
+
+Example: `tifin.adversarial.finance.equities.j.session.bear-42` —
+TIFIN's adversarial finance/equities agent that accepts JSON, lives
+for one session, named `bear-42`.
+
+**Pattern.** A wildcard URI that matches a set of agents. Routing,
+broadcast, and discovery all use the same pattern syntax:
+
+```
+*.adversarial.science.*.s.*.*
+```
+
+**Code.** Hierarchical dotted message type, with families:
+`adversarial.debate`, `interview.text`, `human.query`,
+`collaborative.reason`. Codes carry payload-tier requirements (does
+this code need a string? JSON? embeddings?) which the
+compatibility matrix enforces.
+
+**Recipe.** A `(role, mode) → render(system, ctx) → str` function in
+`ahp.adapters.prompts`. Format-agnostic; the *system* slot is the
+agent's persona, the *ctx* carries query-specific context. 51 ship
+in the box; you can register more.
+
+**Format.** A named bundle that composes recipes into an
+opening/middle/closing turn pattern: `debate` uses
+`adversarial:debate-me` then `adversarial:debate-others` then
+`adversarial:closing`. 16 ship; one entry in
+[`ahp/adapters/formats.py`](ahp/adapters/formats.py) per format.
+
+**Tool.** An async function decorated with
+`@tool(scope, kind, role, category, operation=...)` registered to a
+shared `ToolRegistry`. Global tools at `scope="*"` are visible to
+every agent. Agents bind the visible tools to their chat model via
+LangChain's `create_agent`.
 
 ## Status
+
+This is a pre-1.0 protocol. Primitives (addresses, codes, the
+compatibility matrix, the engine verbs) are stable enough that
+breaking them would hurt. Periphery (recipes, formats, adapters,
+tools, the viewer) is wide open and will keep growing.
+
+* **Tests**: 478 passing on the suite, 1 live-Bedrock smoke gated
+  behind `AHP_RUN_BEDROCK=1`.
+* **Verified end-to-end**: the docker-compose viewer drives real
+  Bedrock + Redis + CloudWatch end-to-end.
+* **Production-readiness**: not yet. No auth on the viewer; no rate
+  limiting on the engine; no replay protection on the bus. Issue list
+  is open.
+
+## Not designed for
+
+So you can self-select before sinking time in:
+
+* **Streaming.** AHP messages are request/response or fan-out/fan-in.
+  There's no per-token streaming primitive. If you need that, this
+  isn't the right layer.
+* **Multi-user IAM.** `AuthPolicy` decides who can register at which
+  address; that's it. Bring your own user system.
+* **Cross-network federation by default.** Federation works (see the
+  example) but only over a *shared* Redis. There's no DHT, no
+  cross-cluster discovery.
+* **Replacing your agent framework.** AHP is the *messaging layer*
+  between agents; it adapts to LangGraph / DSPy / deepagents, it does
+  not replace them.
+
+## Phase index
+
+This branch has shipped 19 phases. Each phase commit explains *why*
+not just *what*. Skim `git log --oneline` for the narrative arc.
+
+| Phase | Module | Notes |
+|-------|--------|-------|
+| 1 | `ahp.core` | addresses, patterns, codes, messages, compatibility |
+| 2 | `ahp.transport` + `ahp.registry` | RedisBus, ProtocolCache, registry |
+| 3 | `ahp.engine` | ProtocolEngine, ThreadManager |
+| 4 | `ahp.adapters` | base, LangGraph, DSPy, deep agent, human, factory, provisioning, capabilities, tool/resource registries, MCP passthrough |
+| 5 | `ahp.demo.*` | stubbed + Bedrock end-to-end demos |
+| 14–17 | addressable storage, auth, CLI, federation |
+| 18 | `ahp.audit` | typed events, CloudWatch sink |
+| 19 | recipes (51), formats (16), tools, docker viewer | this phase |
+
+## Contributing
+
+This is open source. We're early enough that meaningful contributions
+don't require committee approval.
+
+The protocol primitives are settled; the periphery is wide open.
+Good first contributions:
+
+* **A new recipe.** Add a `Recipe(role, mode, description, render)`
+  entry to [`ahp/adapters/prompts.py`](ahp/adapters/prompts.py). Each
+  is ~5 lines. We'd love more interview-style recipes for specific
+  domains.
+* **A new format.** Compose existing recipes into a turn pattern in
+  [`ahp/adapters/formats.py`](ahp/adapters/formats.py). One dataclass
+  entry, no code changes needed.
+* **A new tool.** Decorate a function with `@tool(scope="*", ...)`.
+  See [`ahp/tools/research.py`](ahp/tools/research.py) for the
+  shape. Tools we'd love: web fetch + reader, ArXiv search, code
+  execution sandbox, vector-DB query.
+* **A new adapter.** Wrap your favorite framework
+  ([CrewAI](https://github.com/joaomdmoura/crewai),
+  [PydanticAI](https://github.com/pydantic/pydantic-ai),
+  [smolagents](https://github.com/huggingface/smolagents),
+  AutoGen) as an `AHPAgent` subclass so its agents speak the
+  protocol.
+* **A new audit sink.** Loki, OpenSearch, Honeycomb, S3 — all small
+  classes that implement the `AuditSink` protocol.
+* **Documentation and examples.** Real-world session transcripts,
+  blog posts about specific recipes, a Jupyter notebook walkthrough.
+
+How to ship one:
+
+1. Fork, branch, write your change.
+2. Run `pytest` from the repo root — needs to stay green.
+3. Open a PR. We'll review and merge fast for small additions to the
+   periphery; protocol-touching changes need a short discussion first.
+
+For ideas, bug reports, or "what about X?" discussions, open an issue
+or start a GitHub discussion. No formal contributor agreement yet.
+
+---
+
+## Reference
+
+Everything below is API reference for the existing primitives. If
+you've read this far and want depth, keep going. If you just want to
+ship something, the [examples](examples/) directory and the snippet
+at the top are the best starts.
+
+### Status (legacy phases)
 
 | Phase | Module | State |
 |-------|--------|-------|

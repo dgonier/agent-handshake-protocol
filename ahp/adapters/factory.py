@@ -106,6 +106,9 @@ class AgentFactory:
         groups: GroupRegistry | None = None,
         scope: ScopePolicy | None = None,
         slm: ChatModel | None = None,
+        *,
+        host_server_id: str | None = None,
+        fund_agents: bool = False,
     ) -> None:
         self._engine = engine
         self._regs: list[_Registration] = []
@@ -116,6 +119,16 @@ class AgentFactory:
         self._inviter: Inviter | None = Inviter(slm) if slm is not None else None
         # Address → persona system prompt, populated by invite().
         self._personas: dict[str, str] = {}
+        # Wallet seeding. When fund_agents=True, every newly-provisioned
+        # agent gets a starting balance from its lifecycle's funding
+        # source (see :mod:`ahp.economy.agent_banker`). The host
+        # server's id is the funder for ``session`` agents.
+        self._host_server_id = host_server_id
+        self._fund_agents = fund_agents
+        self._banker: "AgentBanker | None" = None
+        if fund_agents:
+            from ahp.economy.agent_banker import AgentBanker
+            self._banker = AgentBanker(engine.bus.redis)
         # Use explicit None checks rather than ``x or DefaultFactory()`` —
         # all the registries define ``__len__`` so an empty user-supplied
         # instance would be falsy and silently replaced with a fresh one.
@@ -424,14 +437,46 @@ class AgentFactory:
         lifecycle: str = "session",
         mode_hint: str | None = None,
     ) -> SpawnResult:
-        """:meth:`invite` + ``register()`` + ``start()`` for each new agent."""
+        """:meth:`invite` + (optionally) fund + ``register()`` + ``start()``.
+
+        When ``fund_agents=True`` was passed to the factory, each new
+        agent is also seeded with its lifecycle-appropriate starting
+        balance before it goes live. If funding fails (host server out
+        of credits, commons exhausted), provisioning fails loudly —
+        we don't quietly spawn unfunded agents.
+        """
         result = await self.invite(
             org=org, role=role, domain=domain, subdomain=subdomain,
             topic=topic, count=count, accept=accept, lifecycle=lifecycle,
             mode_hint=mode_hint,
         )
+        if self._banker is not None:
+            for agent in result.new:
+                await self._banker.fund_agent(
+                    agent.address, host_server_id=self._host_server_id,
+                )
         for agent in result.new:
             await agent.register()
         for agent in result.new:
             await agent.start()
         return result
+
+    @property
+    def banker(self) -> "AgentBanker | None":
+        return self._banker
+
+    @property
+    def host_server_id(self) -> str | None:
+        return self._host_server_id
+
+    async def drain_agent(self, agent: AHPAgent) -> float:
+        """Refund an agent's residual balance per its lifecycle.
+
+        Called by the runner during teardown. Returns the amount
+        transferred (0 if banking is disabled or no balance remains).
+        """
+        if self._banker is None:
+            return 0.0
+        return await self._banker.drain_agent(
+            agent.address, host_server_id=self._host_server_id,
+        )
