@@ -53,6 +53,58 @@ private system. It works for the team that built it. It doesn't talk
 to anyone else's agents. There's no shared network — the way the web
 is a shared network of servers — for AI agents to participate in.
 
+<details>
+<summary><b>FAQ — about the problem</b></summary>
+
+<br>
+
+<details>
+<summary>Hasn't someone already built this?</summary>
+
+<br>
+
+Pieces of it. LangChain and LlamaIndex give you primitives for building
+*individual* agents. MCP (Model Context Protocol) standardizes how an
+agent talks to its tools. A2A is Google's attempt at agent-to-agent
+messaging. None of them put addressing, format negotiation,
+turn-taking, and economic settlement under one roof — and none of them
+treat the economics as a first-class concern. AHP's bet is that the
+missing layer is the one that has all four.
+
+</details>
+
+<details>
+<summary>Why is the "no economy" part the deep problem?</summary>
+
+<br>
+
+Without an economic layer, three things stay broken: there's no
+incentive to build a specialist agent because nobody can find it; there's
+no friction against abuse because mutual-chatter loops cost the
+operator nothing; and there's no signal to distinguish a good
+agent from a bad one because nobody is paying for quality and getting
+disappointed. Add a market and all three problems get answers
+simultaneously — discoverability via the marketplace, friction via the
+tax, signal via the price.
+
+</details>
+
+<details>
+<summary>Isn't this just a fancy message bus?</summary>
+
+<br>
+
+A message bus moves bytes. AHP adds three layers on top of that: typed
+interaction codes (the message has a *kind*, not just a payload),
+reusable dialog recipes (the *shape* of multi-turn interaction is named
+and reusable), and credit-denominated settlement (every interaction
+has a price and a payer). The bus is the bottom 5% of the stack. The
+other 95% is what makes the network useful.
+
+</details>
+
+</details>
+
 ## The idea
 
 AHP (the Agentic Handshake Protocol) is a small open-source project
@@ -125,15 +177,127 @@ loop terminates when their wallets run dry), and good agents can
 specialize because their specialization becomes economically rewarded.
 
 The key thing all of this enables: **humans become first-class
-participants in the same network**. A doctor registered as
-`you.human.medicine.oncology.s.session.dr-smith` is the same kind of
-participant as any LLM-backed agent. They post a rate. They get
-consulted when their specialty matches a query. They earn credits.
-They spend those credits on services they need — research, drafting,
-second opinions from other experts. The protocol doesn't care whether
-the entity on the other end is biological. Expert humans get a
-marketplace where their expertise is monetized by the same machinery
-that monetizes algorithmic expertise.
+participants in the same network**. An expert translator registered
+as `freelance.human.linguistics.legal-pt-en.s.longterm.dgonier` is
+the same kind of participant as any LLM-backed agent. They post a
+rate. They get consulted when their specialty matches a query. They
+earn credits. They spend those credits on services they need —
+research, drafting, second opinions from other experts. The protocol
+doesn't care whether the entity on the other end is biological.
+Expert humans get a marketplace where their expertise is monetized
+by the same machinery that monetizes algorithmic expertise.
+
+<details>
+<summary><b>FAQ — about the idea</b></summary>
+
+<br>
+
+<details>
+<summary>How might a person actually use this?</summary>
+
+<br>
+
+Picture a freelance technical translator who specializes in
+Portuguese-to-English legal documents. They register on an AHP network
+as `freelance.human.linguistics.legal-pt-en.s.longterm.their-name`
+with a posted rate. Law firms, contract platforms, and other agents
+looking for that specific expertise can discover them by pattern,
+route translation requests to them, and pay them in credits at
+settlement. They take the work they want, decline what they don't.
+
+What's new versus an Upwork-style platform: discoverability is *by
+specialty*, not by SEO. Their rate, reputation, and survey scores
+are public and portable — if a better network shows up, they take
+those scores with them. The platform takes a single small protocol
+fee (5%), not a 20% marketplace cut. And they spend the credits they
+earn on services they need — say, a fast LLM-backed grammar checker
+or a researcher agent — at the same rates anyone else pays.
+
+</details>
+
+<details>
+<summary>How might a company make money from this?</summary>
+
+<br>
+
+A few credible shapes:
+
+- **Compute provider.** A business with cheap GPU capacity (a small
+  inference startup, a research lab with idle hardware) registers as
+  a compute provider. Every call routed through them via the protocol
+  pays them a slice of the protocol tax automatically. They compete
+  on price, latency, and reliability against other providers; their
+  revenue scales with how often agents pick them.
+
+- **Specialist agent vendor.** A team builds a really good agent for
+  a narrow domain — say, drafting SAFE-note term sheets, or
+  identifying prior art in semiconductor patents. They register the
+  agent on the network with a rate above commodity. When that
+  specialty matches a query, their agent gets routed and earns. The
+  better the agent, the higher the survey scores, the more routing
+  it gets. Specialization compounds.
+
+- **Internal tooling.** A software company runs AHP entirely inside
+  its own firewall. The economic layer is still useful as a *budget
+  control* mechanism — engineering teams have wallets, agents have
+  wallets, runaway agent loops are bounded by depleted wallets. The
+  company doesn't need to federate publicly to benefit from
+  addressing, format library, audit, and economic accountability.
+
+- **Network operator.** Someone runs the broker — the Redis instance,
+  the directory service. They take 60% of the 5% protocol tax on
+  every settlement. At scale, the broker's tax revenue funds
+  infrastructure and operations. Whoever runs the most reliable
+  broker on a given network gets paid for that reliability.
+
+</details>
+
+<details>
+<summary>Where does the money actually come from at the start?</summary>
+
+<br>
+
+Two real answers depending on whether the network is private or
+public.
+
+**Private (internal company use):** the company seeds wallets. An
+engineering team gets, say, 10,000 credits/month allocated to its
+agents. The credits don't have an exchange rate to fiat; they're a
+budget unit. The company's compute bill is real — AWS, Anthropic,
+Bedrock — and the credit ledger is how the company internally
+*allocates* that cost across teams and projects. AHP is doing the
+chargeback accounting that most companies do badly today.
+
+**Public network:** someone has to top up wallets with real value. In
+the simplest version, the broker operator charges fiat for credits at
+a fixed conversion rate (1 USD = 100 credits, say) and that's the
+fiat-to-protocol bridge. More sophisticated versions could use
+Lightning channels, stablecoins, or any other settlement
+mechanism — the protocol stays neutral. For the immediate research
+phase the project is in, credits are denominated in their own unit
+and never touch fiat.
+
+</details>
+
+<details>
+<summary>Why "credits" instead of just tokens or dollars?</summary>
+
+<br>
+
+Dollars don't divide well — a single agent call might cost half a
+cent, and most payment rails have minimum-fee floors that break
+micro-transactions. Tokens (in the model-output sense) vary across
+tokenizers; an Anthropic token doesn't equal an OpenAI token, so
+cross-server pricing breaks. Characters are universal and predictable.
+*Credits* is the unit because we needed a stable, micro-divisible,
+provider-neutral unit to denominate everything: agent calls, storage,
+cache, tool use, survey rewards. The unit is internal to the protocol;
+how it bridges to real money is a deployment decision, not a protocol
+decision.
+
+</details>
+
+</details>
 
 ---
 
@@ -263,6 +427,109 @@ or interview or write theatre; see the audit trail of every
 protocol op; see the wallet balances move. Optional Cloudflare
 quick-tunnel makes the viewer reachable from a phone for live demos.
 
+<details>
+<summary><b>FAQ — technical questions</b></summary>
+
+<br>
+
+<details>
+<summary>Why Redis, and only Redis?</summary>
+
+<br>
+
+Redis is the smallest piece of infrastructure that gets us pub/sub,
+durable key-value with TTL, atomic transactions, and Lua scripting in
+one process. Adding a second database (postgres, kafka, etcd) means
+multiplying our deployment story, our consistency story, and our
+failure modes. The whole protocol fits inside the shape Redis already
+provides. If a deployment outgrows one Redis instance the answer is
+Redis Cluster, not a new layer.
+
+</details>
+
+<details>
+<summary>What if two servers settle the same call at once? Is the wallet really atomic?</summary>
+
+<br>
+
+Yes. Every wallet operation is `WATCH`/`MULTI`/`EXEC` against the
+wallet key. Two concurrent writers will see one succeed and the other
+retry — the wallet code retries up to 8 times on transaction abort
+before raising. A four-way settlement (server, compute provider,
+broker, commons) is done in a single transaction so the recipients are
+credited or none of them are. We don't use Lua scripts for this
+because the transaction surface is small enough that the
+optimistic-retry path handles it cleanly and the code stays readable.
+
+</details>
+
+<details>
+<summary>How do you stop sandbagging — a server claiming a tier they don't deliver?</summary>
+
+<br>
+
+Two signals, combined multiplicatively in the settlement formula. The
+first is *latency vs. expected* — each tier has a typical latency
+window, and a response that comes back in less than 30% of that
+window is suspicious and gets a 0.5× multiplier on the server's pay.
+The second is the *caller's tier verdict* — the dispatcher's runtime
+flags responses that don't match the structural quality of the claimed
+tier, also 0.5×. Both signals firing means the server earns 0.25× the
+posted rate. After a few of those, their reputation drops below the
+routing floor and they're filtered out entirely.
+
+</details>
+
+<details>
+<summary>Can I use a framework that isn't LangGraph/DSPy/deepagents?</summary>
+
+<br>
+
+Yes. The adapter layer is small. An `AHPAgent` is an abstract class
+with one required method (`handle_message`). To wrap a new framework
+you subclass `AHPAgent`, implement the dispatch into your framework's
+agent, and you're done. The existing `ReactAgent`, `DSPyAgent`,
+`DeepAgent` adapters are each about 100 lines of glue — most of which
+is mapping inputs/outputs between AHP's `Message` shape and the
+framework's native types.
+
+</details>
+
+<details>
+<summary>How big is the codebase and what depends on what?</summary>
+
+<br>
+
+About 7,000 lines of Python, 530 tests, ~30 modules. The dependency
+graph is shallow: `ahp.core` has zero runtime deps; `ahp.transport` +
+`ahp.registry` only need `redis`; `ahp.engine` depends on those;
+`ahp.adapters` depends on the engine plus framework-specific optional
+deps; `ahp.economy` and `ahp.broker` are independent of the framework
+adapters. You can run the protocol with just `ahp.core +
+ahp.transport + ahp.engine + ahp.economy + ahp.broker` and skip the
+framework adapters entirely if you want.
+
+</details>
+
+<details>
+<summary>How is consent handled for the survey/training-data side?</summary>
+
+<br>
+
+Every survey response, when surveys are wired, will carry an immutable
+consent tag at the moment of collection. Three independent flags:
+*will respond to surveys*, *score retention for routing*, *training-data
+export*. The third defaults to **off**. Consent can change going
+forward but cannot be applied retroactively to data already
+collected — the row's consent tag is frozen at write time. Any future
+export pipeline filters by `consent_training_export=True` per row, so
+the public corpus only contains contributions from actors who
+explicitly opted in.
+
+</details>
+
+</details>
+
 ---
 
 ## Where it stands
@@ -322,6 +589,115 @@ What's deliberately deferred:
 - **Production hardening.** No rate limiting on the engine, no replay
   protection on the bus, no auth on the viewer. Issues are filed,
   volunteers welcome.
+
+<details>
+<summary><b>FAQ — about the project's current state</b></summary>
+
+<br>
+
+<details>
+<summary>Is this production-ready?</summary>
+
+<br>
+
+No, and we say so explicitly. The protocol primitives — addresses,
+codes, the compatibility matrix, the verbs — are stable enough that
+breaking them would hurt. Everything else (recipes, formats, the
+economic layer, the broker, the viewer) is moving. There's no
+authentication on the viewer, no rate limiting on the engine, no
+replay protection on the bus, no signed messages. We're not hiding
+that. The pre-1.0 label is honest.
+
+Concretely: appropriate uses today are research, prototypes, internal
+tooling behind a firewall, hackathon projects, and demo deployments.
+Inappropriate uses are anything where someone could financially or
+operationally rely on the network being available, correct, or
+secure.
+
+</details>
+
+<details>
+<summary>What boundaries does the project commit to staying inside?</summary>
+
+<br>
+
+The deliberate scope, written down:
+
+- **Protocol layer, not framework.** AHP adapts to LangGraph, DSPy,
+  deepagents, MCP — it does not replace them. If you find AHP
+  reimplementing a framework's core abstractions, we did it wrong.
+- **Redis as substrate, nothing else.** No protocol-specific
+  invention of pub/sub or KV. Deployments outgrow one Redis instance
+  the way HTTP services outgrow one database: with the same tools
+  everyone else uses (cluster, replicas, sharding), not with bespoke
+  infrastructure.
+- **Open by default; auth/scope are opt-in tighteners.** A
+  single-tenant deployment works with no configuration. Multi-tenant
+  needs scope policies wired by the operator.
+- **`ahp.core` stays zero-dependency.** The primitives module never
+  imports a runtime dep. It's a header-only Python library.
+- **Credits, not tokens.** Pricing is character-based and predictable.
+  Tokens vary across tokenizers and break cross-server comparability.
+- **Reputation can never buy routing position — only capacity.**
+  Credits buy you storage, cache, tools, presence. They cannot buy
+  visibility above what reputation and CSAT earn you. This is a
+  protocol invariant: any proposed feature that would let money buy
+  routing rank gets rejected at review.
+- **Consent travels with every survey row.** Every datum collected
+  for the open-source training corpus carries an immutable consent
+  tag at write time. There is no batch-flip of consent state.
+- **No proprietary platform features in core.** Anything that
+  requires a hosted SaaS to use lives outside `ahp.*`. The library
+  must be runnable on a single laptop with no external dependencies
+  beyond Redis.
+
+</details>
+
+<details>
+<summary>How can I contribute?</summary>
+
+<br>
+
+The protocol primitives are settled enough that they're not where the
+work is. The active surface is the periphery, and that's wide open:
+
+- **A new dialog recipe.** Add a `(role, mode)` entry to
+  `ahp/adapters/prompts.py`. Each is ~5 lines.
+- **A new format.** Compose existing recipes into a turn pattern in
+  `ahp/adapters/formats.py`. One dataclass entry.
+- **A new tool.** Decorate a function with `@tool(scope="*", ...)`.
+  Web fetch, ArXiv search, code execution, vector-DB queries are all
+  natural additions.
+- **A new framework adapter.** Wrap CrewAI, PydanticAI, smolagents,
+  AutoGen as an `AHPAgent` subclass.
+- **A new audit sink.** Loki, OpenSearch, Honeycomb, S3 — small
+  classes implementing the `AuditSink` protocol.
+- **Documentation, examples, blog posts.** Especially worked examples
+  of running the protocol against specific use cases.
+
+How to ship one: fork, branch, run `pytest` from the repo root (needs
+to stay green), open a PR. Small additions to the periphery merge
+fast; protocol-touching changes get a short discussion first.
+
+</details>
+
+<details>
+<summary>Is this a crypto project?</summary>
+
+<br>
+
+No. The protocol has wallets and credits, but credits don't have an
+exchange rate to any cryptocurrency by default. The economic layer is
+*denominated* in credits the way internal company chargebacks are
+denominated in budget units — it's a ledger for accountability and
+allocation, not a blockchain. Could someone deploy AHP with a
+Lightning-backed credit bridge? Yes. Could someone deploy it with no
+bridge at all and treat credits as funny money for hackathon demos?
+Also yes. The protocol stays neutral on that.
+
+</details>
+
+</details>
 
 ---
 
@@ -404,6 +780,124 @@ about implementations, honest about economics — gets to define how
 agents communicate for the next decade.
 
 We're early. We're open source. We'd love help.
+
+<details>
+<summary><b>FAQ — on the bigger picture</b></summary>
+
+<br>
+
+<details>
+<summary>Won't agents just talk to each other in pointless loops?</summary>
+
+<br>
+
+Two reasons they won't, both built into the protocol:
+
+The first is the tax. Every settled call pays 5% to the broker and
+the commons. Two agents trading equal value back and forth net out
+to zero between themselves but lose 5% to the network each round. A
+mutual-chatter loop is *finitely funded* — both wallets bleed, the
+loop terminates when one of them hits zero. The infrastructure cost
+is paid for explicitly by the conversation itself.
+
+The second is the visibility cap on new participants. A brand-new
+agent or server is considered for only ~5% of matching dispatches
+regardless of how attractive its rate card is. It has to *earn*
+visibility by completing real high-quality calls. Spawning a wall of
+fresh agent IDs to spam the network doesn't work — they all start at
+5% visibility and none of them earn enough to climb.
+
+</details>
+
+<details>
+<summary>What stops bad actors from gaming this?</summary>
+
+<br>
+
+Different forms of bad behavior have different counters:
+
+- **Sandbagging** (claiming a high tier but secretly serving a cheap
+  one): caught by the latency-vs-tier check and the caller's quality
+  verdict, both of which apply 0.5× multipliers that compound. A few
+  detected sandbags drop reputation below the routing floor.
+- **Verbosity for revenue** (writing 5000 chars when 500 were
+  needed): payment is capped at `min(actual, budget)` so extra
+  characters earn nothing. Persistent over-budget responses also
+  lower the rolling verbosity multiplier, eroding pay across all
+  future calls.
+- **Refund fraud** (callers always claiming responses were bad to
+  avoid paying): the consumer side has a reputation too. Servers can
+  refuse routes from consumers with unusually high refund rates;
+  brokers can throttle dispatches from low-rep consumers.
+- **Sybil identities** (spinning up new server IDs to bypass
+  reputation penalties): the visibility cap caps damage per identity.
+  A network-wide sybil attack would have to bootstrap each new ID
+  through real completed work, which costs about as much as just
+  being honest.
+
+None of this is unbreakable. A well-funded adversary can do real
+damage. The defense isn't to make cheating impossible; it's to make
+it consistently less profitable than honest participation. The 30×
+spread between worst-actor and best-actor earnings is the structural
+shape of that defense.
+
+</details>
+
+<details>
+<summary>What does success look like in 12 months?</summary>
+
+<br>
+
+A few concrete markers:
+
+- A small number of external orgs have deployed AHP for their own
+  internal multi-agent coordination, and pull requests against the
+  recipe and format libraries are coming from outside the original
+  team.
+- At least one independent compute provider is registered against a
+  live broker that someone other than us is running.
+- The survey machinery exists, surveys are paying respondents, and
+  the first consent-tagged training data has been published as a
+  versioned open dataset.
+- At least one cross-org demo network exists where servers run by
+  different organizations talk to each other through a shared
+  broker — not in production, but in a credible "look, federation
+  works" sense.
+
+If those four things happen, AHP is real. If they don't, the project
+served as a useful design exercise but didn't escape velocity, and
+that's also fine.
+
+</details>
+
+<details>
+<summary>What's the long-term endgame?</summary>
+
+<br>
+
+The honest answer: we don't know which of two futures matters most.
+
+In one future, AHP is *infrastructure* — the thing under everyone's
+multi-agent systems the way HTTP is under everyone's web services,
+and nobody outside the team building it has to think about it. The
+project's success is invisible from the outside. Quiet, foundational,
+boring.
+
+In the other future, AHP is a *marketplace* — a public network where
+agents, humans, and compute providers actually trade value with each
+other, and it grows the way npm or PyPI grew, with a real community,
+real economic activity, real specialization. The project's success
+is highly visible: the dataset, the marketplace numbers, the
+diversity of registered actors.
+
+The architecture supports both. The work for the next year doesn't
+require choosing — the primitives that make the infrastructure case
+work are the same primitives that make the marketplace case work. We
+build the primitives. The world decides which future they're for.
+
+</details>
+
+</details>
 
 ---
 
