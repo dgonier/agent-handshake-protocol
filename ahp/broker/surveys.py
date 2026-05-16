@@ -69,6 +69,23 @@ SURVEY_QUEUE_KEY = "ahp:survey:queue"
 SURVEY_REQUEST_KEY = "ahp:survey:request:{survey_id}"
 SURVEY_RESPONSE_KEY = "ahp:survey:response:{survey_id}"
 SURVEY_RESPONSE_INDEX = "ahp:survey:responses"
+SURVEY_FIRED_INDEX = "ahp:survey:fired"
+"""SET of survey_ids that have been dispatched to their surveyed actor.
+
+Lives in the same ``ahp:`` namespace. Idempotent dispatch: a survey
+whose id is in this set is skipped by :meth:`SurveyQueue.fire_due`
+even if its dispatch_at remains in the past. Cleared (along with the
+request) on :meth:`SurveyQueue.submit_response` and on expiry.
+"""
+
+DEFAULT_BROKER_ADDRESS = "broker.broker.survey.system.s.longterm.surveys"
+"""Address used as the source for dispatched survey messages.
+
+Surveys come *from the broker*; this is a stable, registry-shaped
+address that consumers can pattern-match if they want to opt into or
+out of broker-originated traffic. The accept tier is ``s`` (structured
+text) because the survey payload is JSON.
+"""
 
 
 SurveyKind = Literal[
@@ -302,6 +319,128 @@ class SurveyQueue:
             out.append(req)
         return out
 
+    # ── dispatch ─────────────────────────────────────────────────────
+
+    async def fire_due(
+        self,
+        *,
+        bus: Any = None,
+        broker_address: str = DEFAULT_BROKER_ADDRESS,
+        max_dispatch: int = 50,
+        now: float | None = None,
+    ) -> list[SurveyRequest]:
+        """Dispatch ready surveys as :class:`Message`-s on the bus.
+
+        Walks every pending survey whose ``dispatch_at`` has passed
+        and isn't already in the fired set. For each, sends a
+        ``Code.HUMAN_OBSERVE`` SEND message to the survey's
+        ``surveyed_actor`` address, carrying the survey_id + context
+        the actor needs to vote.
+
+        Idempotency: a successfully-dispatched survey's id is added
+        to :data:`SURVEY_FIRED_INDEX`. A second call to ``fire_due``
+        skips it. ``submit_response`` clears the marker.
+
+        ``bus=None`` is the **dry-run** path: ready surveys are
+        returned (and *not* marked fired), so a caller can inspect
+        what would be dispatched without committing the message
+        traffic. Useful for tests and the ``ahp list-surveys`` view.
+
+        Returns the list of surveys that were dispatched (or, in
+        dry-run, would be). Each return value is the actual
+        :class:`SurveyRequest`, so the caller can re-inspect consent
+        flags or settlement_id without re-fetching from Redis.
+        """
+        cutoff = now if now is not None else time.time()
+        ready: list[SurveyRequest] = []
+        # We don't use list_pending here because we want to deduplicate
+        # against SURVEY_FIRED_INDEX ourselves. ZRANGEBYSCORE drives
+        # the order.
+        ids = await self._redis.zrangebyscore(
+            SURVEY_QUEUE_KEY, min="-inf", max=cutoff,
+            start=0, num=max_dispatch * 2,  # over-fetch to cover skips
+        )
+        for sid in ids:
+            if isinstance(sid, (bytes, bytearray)):
+                sid = sid.decode("utf-8")
+            req = await self.get_request(sid)
+            if req is None:
+                await self._redis.zrem(SURVEY_QUEUE_KEY, sid)
+                continue
+            if req.expires_at <= cutoff:
+                await self._abandon(sid)
+                continue
+            already_fired = await self._redis.sismember(
+                SURVEY_FIRED_INDEX, sid,
+            )
+            if already_fired:
+                continue
+            ready.append(req)
+            if len(ready) >= max_dispatch:
+                break
+
+        if bus is None:
+            return ready
+
+        # Real dispatch path.
+        from ahp.core import AgentAddress, Code, Message
+        source = AgentAddress.parse(broker_address)
+        dispatched: list[SurveyRequest] = []
+        for req in ready:
+            try:
+                target = AgentAddress.parse(req.surveyed_actor)
+            except ValueError:
+                log.warning(
+                    "survey %s: surveyed_actor %r is not a valid "
+                    "AgentAddress; skipping dispatch",
+                    req.survey_id, req.surveyed_actor,
+                )
+                continue
+            msg = Message(
+                source=source, target=target,
+                code=Code.HUMAN_OBSERVE, verb="SEND",
+                body={
+                    "kind": "survey",
+                    "survey_id": req.survey_id,
+                    "survey_kind": req.kind,
+                    "target_server": req.target_server,
+                    "recipe": req.recipe,
+                    "settlement_id": req.settlement_id,
+                    "reward": req.reward,
+                    "expires_at": req.expires_at,
+                    "consent_csat_routing_at_queue": req.consent_csat_routing_at_queue,
+                    "consent_training_export_at_queue": req.consent_training_export_at_queue,
+                    "prompt": (
+                        "rate the response from "
+                        f"{req.target_server} (recipe={req.recipe}). "
+                        "submit a score in [0,1] with "
+                        "`ahp vote --survey-id "
+                        f"{req.survey_id} --score N`"
+                    ),
+                },
+                thread=f"survey::{req.survey_id}",
+            )
+            try:
+                await bus.send(msg)
+            except Exception:
+                log.exception(
+                    "survey %s: bus.send failed; will retry on next sweep",
+                    req.survey_id,
+                )
+                continue
+            await self._redis.sadd(SURVEY_FIRED_INDEX, req.survey_id)
+            await self._emit(
+                "survey.dispatch",
+                target=req.survey_id,
+                extra={
+                    "surveyed_actor": req.surveyed_actor,
+                    "target_server": req.target_server,
+                    "kind": req.kind,
+                },
+            )
+            dispatched.append(req)
+        return dispatched
+
     # ── response ─────────────────────────────────────────────────────
 
     async def submit_response(
@@ -334,8 +473,10 @@ class SurveyQueue:
         if not was_new:
             return False
         await self._redis.sadd(SURVEY_RESPONSE_INDEX, response.survey_id)
-        # Drop the entry from the pending queue. Idempotent.
+        # Drop the entry from the pending queue + fired marker. Both
+        # idempotent.
         await self._redis.zrem(SURVEY_QUEUE_KEY, response.survey_id)
+        await self._redis.srem(SURVEY_FIRED_INDEX, response.survey_id)
 
         if broker is not None:
             req = await self.get_request(response.survey_id)
@@ -432,6 +573,7 @@ class SurveyQueue:
         surveys lingering past their TTL.
         """
         await self._redis.zrem(SURVEY_QUEUE_KEY, survey_id)
+        await self._redis.srem(SURVEY_FIRED_INDEX, survey_id)
         await self._redis.delete(
             SURVEY_REQUEST_KEY.format(survey_id=survey_id)
         )
@@ -512,14 +654,86 @@ def _anonymize_actor(actor_address: str) -> str:
     return "act-" + hashlib.sha256(actor_address.encode()).hexdigest()[:16]
 
 
-async def export_corpus(*, since: float = 0.0):
-    """Future entry point for the open-source preference-data export.
+async def export_corpus(
+    redis_client: Any,
+    *,
+    since: float = 0.0,
+    anonymize: bool = True,
+) -> list[TrainingDataRow]:
+    """Export consenting :class:`SurveyResponse` rows as
+    :class:`TrainingDataRow` objects, suitable for a HuggingFace
+    datasets-style upload.
 
-    Stubbed. When implemented, this will:
-        - Scan :class:`SurveyResponse` records from ``since`` onward.
-        - Filter to ``consent_training_export=True`` only.
-        - Convert via :meth:`TrainingDataRow.from_response`.
-        - Emit a stable JSONL bundle suitable for HuggingFace
-          datasets upload.
+    Walks ``SURVEY_RESPONSE_INDEX``, loads each response, and emits
+    only rows where ``consent_training_export=True``. The conversion
+    happens through :meth:`TrainingDataRow.from_response` so the
+    consent gating is enforced at one chokepoint.
+
+    Anonymization is on by default — actors get a stable opaque hash.
+    Pass ``anonymize=False`` only when running an internal export and
+    the consumer needs the original address.
+
+    ``since`` is a wall-clock cutoff: only rows whose
+    ``collected_at >= since`` are returned. Default 0.0 = everything.
     """
-    raise NotImplementedError("training-data export pipeline is stubbed; v1 deferred")
+    ids = await redis_client.smembers(SURVEY_RESPONSE_INDEX)
+    out: list[TrainingDataRow] = []
+    for sid in ids:
+        if isinstance(sid, (bytes, bytearray)):
+            sid = sid.decode("utf-8")
+        raw = await redis_client.get(
+            SURVEY_RESPONSE_KEY.format(survey_id=sid)
+        )
+        if raw is None:
+            # Stale index entry — clean up opportunistically.
+            await redis_client.srem(SURVEY_RESPONSE_INDEX, sid)
+            continue
+        try:
+            response = response_from_raw(raw)
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+        if not response.consent_training_export:
+            continue
+        if response.collected_at < since:
+            continue
+        try:
+            out.append(TrainingDataRow.from_response(
+                response, anonymize=anonymize,
+            ))
+        except ValueError:
+            # Defensive: from_response raises if the consent flag is
+            # off; we already filtered above, but the safety net stays.
+            continue
+    # Stable ordering: oldest first so consumers can tail by collected_at.
+    out.sort(key=lambda r: r.collected_at)
+    return out
+
+
+async def write_corpus_jsonl(
+    redis_client: Any,
+    out_path: Any,  # str | Path
+    *,
+    since: float = 0.0,
+    anonymize: bool = True,
+) -> int:
+    """Write the consent-filtered corpus to a JSONL file.
+
+    One :class:`TrainingDataRow` per line, JSON-encoded. Returns the
+    number of rows written.
+
+    The file is opened in text mode with UTF-8 encoding; the caller
+    is responsible for path safety (don't pass user-controlled paths
+    without validation).
+    """
+    rows = await export_corpus(
+        redis_client, since=since, anonymize=anonymize,
+    )
+    from dataclasses import asdict as _asdict
+    from pathlib import Path
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(_asdict(row), default=str))
+            f.write("\n")
+    return len(rows)
