@@ -785,6 +785,100 @@ Composition rules: lists concatenate (priority-first, registration
 order on ties), `prompt` joins with blank lines, `agent_kind` follows
 the highest-priority specifier (default `"react"`).
 
+## Model / compute sources
+
+Three natural sources, each at a different layer:
+
+| Source | What it gives you | When to use |
+|---|---|---|
+| **Bedrock** (`ahp.llm.bedrock`) | Hosted Claude / Llama / Titan on AWS | Default "just give me a smart model" — pay per token, no compute concerns |
+| **OpenRouter** (`ahp.llm.openrouter`) | Unified OpenAI-compatible API to 100+ models | A/B test recipes across providers without rewiring; cheap/fast OSS models alongside frontier ones |
+| **Modal** | Serverless GPUs by the second | Where you actually *run* AHP nodes that need GPUs — HF + peft for LoRA composition, vLLM serving, custom inference. Two patterns: Modal-as-endpoint (use `openrouter_chat_model` pointed at your Modal URL) or Modal-as-AHP-node (a Modal app boots a factory and joins the Redis network). |
+
+```python
+# Bedrock
+from ahp.llm import bedrock_chat_model
+agent = ReactAgent.from_profile(addr, engine, profile, model=bedrock_chat_model())
+
+# OpenRouter
+from ahp.llm import openrouter_chat_model
+agent = ReactAgent.from_profile(
+    addr, engine, profile,
+    model=openrouter_chat_model("anthropic/claude-3.5-sonnet"),
+)
+
+# Modal-hosted endpoint (your own OpenAI-compatible server)
+agent = ReactAgent.from_profile(
+    addr, engine, profile,
+    model=openrouter_chat_model(
+        model="my-llama3-with-loras",
+        base_url=f"https://you--llama-app.modal.run/v1",
+    ),
+)
+```
+
+Extras: `pip install -e ".[aws]"` for Bedrock, `pip install -e ".[openrouter]"`
+for OpenRouter. Modal is BYO — see [examples (planned)](#) for runnable
+patterns once Modal credentials are in your environment.
+
+## LLM recipes — base model + LoRAs as addressable resources
+
+The natural extension of "everything is addressable": **base models
+and LoRA adapters register as `Resource`s with `kind="model"` and
+`kind="lora"`**. The agent's recipe (which base + which adapters)
+becomes a pure consequence of its address.
+
+```python
+from ahp.adapters import resource
+from ahp.llm import LoRAHandle, ModelHandle
+
+@resource("tifin", "model", "*", "*", name="llama3-8b")
+def make_base():
+    return ModelHandle(
+        name="llama3-8b",
+        repo_id="meta-llama/Meta-Llama-3-8B-Instruct",
+    )
+
+@resource(
+    "tifin", "lora", "finance", "*", name="bearish-v2",
+    allowed_for="tifin.adversarial.finance.*.*.*.*",  # role gating
+)
+def make_bearish():
+    return LoRAHandle(
+        name="bearish-v2",
+        repo_id="tifin/finance-bearish-v2",
+        weight=1.0,
+    )
+```
+
+An agent at `tifin.adversarial.finance.equities.s.session.bull` picks
+up both: the base (matches `domain="*"`/`subdomain="*"`) plus
+`bearish-v2` (matches the explicit `allowed_for`). A collaborative
+finance agent gets the base but not `bearish-v2`. Same registry,
+different recipe, by address alone.
+
+Consumers introspect via:
+
+```python
+from ahp.llm import find_model, find_loras, recipe_summary
+
+profile = factory.profile_for(addr)
+base   = find_model(profile)              # ModelHandle | None
+loras  = find_loras(profile)              # list[LoRAHandle] sorted by name
+prompt_fragment = recipe_summary(profile) # for the agent's system prompt
+```
+
+The handles are pure metadata — they don't load weights. A future
+`HuggingFaceAgent` (planned) will consume them via `peft` /
+`transformers` on the Modal side, while the address-level composition
+stays usable on machines without GPUs.
+
+**Wart worth knowing:** `ResourceAddress` has no `role` field, so
+role-discriminated LoRAs need an explicit `allowed_for=` instead of
+inferring "for adversarial agents" from the address alone. The
+convention's default projection only covers scope / domain /
+subdomain.
+
 ## LLM-backed agents — `ReactAgent`, `DeepAgent`, Bedrock
 
 `ReactAgent` (in `ahp.adapters.react_agent`) wraps

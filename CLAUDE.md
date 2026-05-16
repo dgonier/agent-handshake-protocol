@@ -78,7 +78,9 @@ ahp/
 │   ├── deep_agent.py       DeepAgent (wraps deepagents.create_deep_agent)
 │   └── dspy_agent.py       DSPyAgent
 ├── llm/
-│   └── bedrock.py          ChatBedrockConverse helper + creds check
+│   ├── bedrock.py          ChatBedrockConverse helper + creds check
+│   ├── openrouter.py       ChatOpenAI helper for OpenRouter / Modal endpoints
+│   └── recipe.py           ModelHandle / LoRAHandle + recipe finders
 ├── demo/
 │   ├── finance_analysis.py deterministic stub pipeline
 │   └── finance_react.py    Bedrock-driven LLM pipeline
@@ -158,6 +160,26 @@ and the codebase is shaped around them.
     pattern.** `broadcast_to("debaters", ...)` resolves the string
     name to an `AddressPattern`. Names are local to a process; the
     pattern they resolve to is universal.
+
+12. **Three natural model/compute sources: Bedrock, OpenRouter,
+    Modal.** Bedrock and OpenRouter are hosted endpoints (consumed
+    via `ahp.llm.{bedrock,openrouter}`). Modal is where AHP nodes
+    *run* when they need GPUs — either as OpenAI-compatible endpoints
+    (use `openrouter_chat_model(base_url=...)`) or as full AHP nodes
+    that join the Redis network. Don't add other providers ad-hoc;
+    if a fourth source is needed, factor it through the same shape.
+
+13. **LoRAs and base models are addressable resources, not bolted-on
+    config.** `kind="model"` / `kind="lora"` register via the standard
+    `@resource(...)` decorator and return `ModelHandle` / `LoRAHandle`
+    instances (pure metadata, no weights loaded). Agent recipes
+    compose by address: a base at `{scope}.model.*.*.{name}` is
+    visible to every agent in scope; LoRAs at
+    `{scope}.lora.{domain}.{subdomain}.{name}` apply via the standard
+    convention. Caveat: `ResourceAddress` has no `role` field, so
+    role-gated LoRAs need explicit `allowed_for=`. Consumers
+    introspect via `find_model` / `find_loras` / `recipe_summary` in
+    `ahp.llm.recipe`.
 
 ---
 
