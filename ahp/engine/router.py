@@ -301,6 +301,7 @@ class ProtocolEngine:
                 actual_latency_ms=latency_ms,
                 completed_with_caller=0,  # TODO: track per-pair counts
                 tier_verdict="matched",
+                responder=response.source,
             )
         except Exception:
             log.exception("broker settlement failed; refunding hold")
@@ -489,6 +490,7 @@ class ProtocolEngine:
                     actual_latency_ms=latency_ms,
                     completed_with_caller=0,
                     tier_verdict="matched",
+                    responder=response.source,
                 )
             except Exception:
                 log.exception(
