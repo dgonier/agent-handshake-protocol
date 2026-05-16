@@ -27,6 +27,12 @@ from ahp.broker.router import (
     Router,
 )
 from ahp.broker.server_registry import ServerMeta, ServerRegistry
+from ahp.broker.surveys import (
+    SurveyKind,
+    SurveyQueue,
+    SurveyRequest,
+    SurveyResponse,
+)
 
 
 __all__ = [
@@ -38,4 +44,8 @@ __all__ = [
     "RoutingPreferences",
     "ServerMeta",
     "ServerRegistry",
+    "SurveyKind",
+    "SurveyQueue",
+    "SurveyRequest",
+    "SurveyResponse",
 ]

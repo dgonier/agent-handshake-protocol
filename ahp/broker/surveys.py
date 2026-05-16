@@ -1,57 +1,74 @@
-"""Post-hoc CSAT surveys — stubbed; integration shape only.
+"""Post-hoc CSAT surveys — storage + manual collection.
 
 The CSAT (consumer satisfaction) score in :class:`ReputationEntry` is
 a separate dimension from system-observed reputation. It comes from
 asking the consuming actor — agent or human — *after* an interaction
 how useful the response actually was.
 
-This module defines the public surface area that the rest of the
-broker codes against. The actual dispatch loop, queue persistence,
-and per-row training-data export are deliberately not implemented yet
-— they're significant operational work and the protocol can ship
-without them. Reputation scores stay populated by settlement
-verdicts; CSAT scores stay at their neutral default (0.5) until the
-survey loop is implemented.
+This module implements the storage + manual-collection half of the
+survey loop. Auto-firing to actors is still deferred: a survey sits
+in the queue (``ahp:survey:queue``) until something calls
+:meth:`SurveyQueue.submit_response` for it. The "something" can be
+the ``ahp vote`` CLI (human-side) or, eventually, an agent-side
+auto-rate hook.
 
-When the survey loop is built, the contract here is:
+Surveys are *opt-in*. Every actor has three consent flags on their
+:class:`~ahp.broker.ServerMeta` profile:
 
-* Surveys are *opt-in*. Every actor has three consent flags on their
-  :class:`~ahp.broker.ServerMeta` profile: ``survey_opt_in``,
-  ``csat_routing_opt_in``, ``training_data_opt_in``.
-* Survey responses are paid out of the commons pool. Reward amount
-  is configurable per recipe.
-* Every recorded :class:`SurveyResponse` carries a snapshot of the
-  consent flags that were active when it was collected. Consent
-  changes are *not retroactive*: a row collected with
-  ``training_data_opt_in=True`` remains in the corpus even if the
-  actor flips that flag off later. (GDPR-style deletion requests are
-  handled separately by tagging-then-rewriting the export.)
-* The training-data export pipeline filters by
-  ``consent_training_export=True``. Anyone who never opted in never
-  appears.
+* ``survey_opt_in`` — can be queued for surveys at all.
+* ``csat_routing_opt_in`` — CSAT score feeds the router.
+* ``training_data_opt_in`` — responses are eligible for the future
+  open-source export (still stubbed; see :func:`export_corpus`).
 
-Sample rate scales with stakes. A 0.1-credit interaction probably
-doesn't warrant a survey; a 10-credit one does. The broker can
-probabilistically sample so high-value interactions are surveyed
-~always and low-value ones rarely.
+Every recorded :class:`SurveyResponse` carries a snapshot of the
+consent flags that were active when it was collected. Consent changes
+are *not retroactive*: a row collected with
+``consent_training_export=True`` remains eligible for export even if
+the actor flips that flag off later. (GDPR-style deletion requests
+are handled separately by tagging-then-rewriting the export.)
 
-Anti-gaming defenses planned for the real implementation:
+Survey responses are paid out of the commons pool. Reward is set per
+:class:`SurveyRequest` at queue time; the broker debits commons and
+credits the surveyed actor when the response lands.
 
-* Surveying actor's own track record matters: outlier responders
-  (always 5/5 or always 1/5) get their survey weight down-weighted.
-* Reward comes from commons, not from the surveyed server — so
-  the server can't bribe the surveyor to inflate scores.
+Redis layout (single :class:`SurveyQueue` per broker):
 
-When the v1 surveys ship, this module is the public interface
-that callers should already have been importing.
+* ``ahp:survey:queue`` — sorted set; score = ``dispatch_at``,
+  member = ``survey_id``. Cheap ``ZRANGEBYSCORE`` for "what's ready
+  to fire."
+* ``ahp:survey:request:<survey_id>`` — JSON of the
+  :class:`SurveyRequest`. ``SET NX`` on enqueue makes
+  re-enqueue idempotent.
+* ``ahp:survey:response:<survey_id>`` — JSON of the
+  :class:`SurveyResponse` after :meth:`submit_response`.
+* ``ahp:survey:responses`` — set of survey ids that have responses.
+  Cheap iteration for future export.
+
+Anti-gaming defenses planned but NOT yet implemented:
+
+* Outlier responders (always 5/5 or always 1/5) get survey weight
+  down-weighted. Currently every response counts the same.
+* Reward comes from commons, not from the surveyed server — already
+  enforced here; the server can't bribe the surveyor.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 import time
 import uuid
-from dataclasses import dataclass, field
-from typing import Literal
+from dataclasses import asdict, dataclass, field
+from typing import Any, Literal
+
+
+log = logging.getLogger("ahp.broker.surveys")
+
+
+SURVEY_QUEUE_KEY = "ahp:survey:queue"
+SURVEY_REQUEST_KEY = "ahp:survey:request:{survey_id}"
+SURVEY_RESPONSE_KEY = "ahp:survey:response:{survey_id}"
+SURVEY_RESPONSE_INDEX = "ahp:survey:responses"
 
 
 SurveyKind = Literal[
@@ -139,36 +156,251 @@ class SurveyResponse:
     consent_training_export: bool = False
 
 
-# ── interface stubs ───────────────────────────────────────────────────
+# ── queue ─────────────────────────────────────────────────────────────
 
 
 class SurveyQueue:
-    """Broker-side queue that schedules and dispatches surveys.
+    """Broker-side queue for survey requests + responses.
 
-    Stub. When this ships, the queue will:
-        - Persist :class:`SurveyRequest`-s in Redis under
-          ``ahp:survey:queue`` keyed by ``dispatch_at``.
-        - Read its consent snapshot from the surveyed actor's
-          :class:`ServerMeta` at queue time.
-        - Fire dispatch as ``Code.HUMAN_OBSERVE`` messages targeting
-          the surveyed actor's address.
-        - On response, credit the actor from the commons pool by
-          ``request.reward`` and record :class:`SurveyResponse`.
-        - Update the target server's CSAT via :func:`apply_csat`.
-        - Log a :class:`~ahp.audit.AuditEvent` per state change.
+    The queue persists :class:`SurveyRequest` objects in Redis and is
+    the single chokepoint for collecting :class:`SurveyResponse`
+    submissions. It does NOT auto-fire surveys to actors — a caller
+    (the ``ahp vote`` CLI, the runner, or a future cadence loop)
+    walks ``list_pending(...)`` and submits responses on the actor's
+    behalf.
+
+    Operations are designed to be idempotent on ``survey_id`` so a
+    repeated enqueue or submission is a no-op rather than a duplicate.
     """
 
-    def __init__(self, *args, **kwargs):
-        self._stub = True
+    def __init__(
+        self,
+        redis_client: Any,
+        *,
+        commons_wallet_owner: str = "__commons__",
+    ) -> None:
+        self._redis = redis_client
+        self._commons = commons_wallet_owner
 
-    async def enqueue(self, request: SurveyRequest) -> None:
-        raise NotImplementedError("SurveyQueue is stubbed; v1 deferred")
+    # ── enqueue / inspect ────────────────────────────────────────────
 
-    async def fire_due(self) -> int:
-        raise NotImplementedError("SurveyQueue is stubbed; v1 deferred")
+    async def enqueue(self, request: SurveyRequest) -> bool:
+        """Persist a survey request and add it to the dispatch queue.
 
-    async def submit_response(self, response: SurveyResponse) -> None:
-        raise NotImplementedError("SurveyQueue is stubbed; v1 deferred")
+        Idempotent: if a survey with this ``survey_id`` is already
+        stored, the existing record is preserved and this returns
+        False. Returns True when a new entry was written.
+        """
+        key = SURVEY_REQUEST_KEY.format(survey_id=request.survey_id)
+        payload = json.dumps(asdict(request))
+        # SET NX gives us idempotency: first enqueue wins, repeats
+        # return None and we skip the queue add.
+        was_new = await self._redis.set(key, payload, nx=True)
+        if not was_new:
+            return False
+        await self._redis.zadd(
+            SURVEY_QUEUE_KEY,
+            {request.survey_id: request.dispatch_at},
+        )
+        log.info(
+            "survey enqueued: id=%s actor=%s server=%s reward=%.4f",
+            request.survey_id, request.surveyed_actor,
+            request.target_server, request.reward,
+        )
+        return True
+
+    async def get_request(self, survey_id: str) -> SurveyRequest | None:
+        raw = await self._redis.get(
+            SURVEY_REQUEST_KEY.format(survey_id=survey_id)
+        )
+        if raw is None:
+            return None
+        return _request_from_raw(raw)
+
+    async def list_pending(
+        self,
+        *,
+        now: float | None = None,
+        include_future: bool = False,
+        surveyed_actor: str | None = None,
+        limit: int = 100,
+    ) -> list[SurveyRequest]:
+        """Return queued surveys.
+
+        With the defaults: only surveys whose ``dispatch_at`` is in
+        the past or right now, up to ``limit`` entries, oldest first.
+
+        ``include_future=True`` lifts the ``dispatch_at <= now`` gate
+        — useful for the CLI's "what's queued, in any state" view.
+
+        ``surveyed_actor`` filters to surveys targeting a specific
+        actor address — what an agent / human would ask before voting.
+        """
+        cutoff = now if now is not None else time.time()
+        max_score = "+inf" if include_future else cutoff
+        ids = await self._redis.zrangebyscore(
+            SURVEY_QUEUE_KEY, min="-inf", max=max_score,
+            start=0, num=limit,
+        )
+        out: list[SurveyRequest] = []
+        for sid in ids:
+            if isinstance(sid, (bytes, bytearray)):
+                sid = sid.decode("utf-8")
+            req = await self.get_request(sid)
+            if req is None:
+                # Stale queue entry pointing at a deleted record. Tidy
+                # up opportunistically.
+                await self._redis.zrem(SURVEY_QUEUE_KEY, sid)
+                continue
+            if req.expires_at <= cutoff:
+                # Expired — drop both the request and its queue entry.
+                await self._abandon(sid)
+                continue
+            if surveyed_actor and req.surveyed_actor != surveyed_actor:
+                continue
+            out.append(req)
+        return out
+
+    # ── response ─────────────────────────────────────────────────────
+
+    async def submit_response(
+        self,
+        response: SurveyResponse,
+        *,
+        broker: Any = None,
+    ) -> bool:
+        """Record a response, credit the actor, update CSAT.
+
+        Returns True when the response was newly recorded, False if
+        a response with this ``survey_id`` already exists (idempotent
+        re-submission is a no-op).
+
+        Side effects when broker is wired:
+        1. Persist the :class:`SurveyResponse` and add to the response
+           index.
+        2. Debit ``request.reward`` from the commons wallet, credit
+           the surveyed actor.
+        3. Apply CSAT update to the target server's reputation via
+           :func:`~ahp.economy.reputation.apply_csat`.
+        4. Remove the request from the pending queue.
+
+        ``broker=None`` is allowed for tests that only want to
+        exercise persistence — steps 2 and 3 are then skipped.
+        """
+        resp_key = SURVEY_RESPONSE_KEY.format(survey_id=response.survey_id)
+        payload = json.dumps(asdict(response))
+        was_new = await self._redis.set(resp_key, payload, nx=True)
+        if not was_new:
+            return False
+        await self._redis.sadd(SURVEY_RESPONSE_INDEX, response.survey_id)
+        # Drop the entry from the pending queue. Idempotent.
+        await self._redis.zrem(SURVEY_QUEUE_KEY, response.survey_id)
+
+        if broker is not None:
+            req = await self.get_request(response.survey_id)
+            if req is not None:
+                await self._pay_and_score(req, response, broker)
+
+        log.info(
+            "survey response submitted: id=%s actor=%s score=%.2f",
+            response.survey_id, response.surveyed_actor, response.score,
+        )
+        return True
+
+    async def _pay_and_score(
+        self,
+        request: SurveyRequest,
+        response: SurveyResponse,
+        broker: Any,
+    ) -> None:
+        """Apply the wallet + CSAT side effects of a submission.
+
+        Failures here are logged but do not raise — the response is
+        already durably recorded; a transient broker failure shouldn't
+        bubble up to whoever just submitted a vote.
+        """
+        # Wallet: commons -> actor.
+        if request.reward > 0:
+            try:
+                # Take the reward from commons. We model this as a
+                # hold + immediate settle: hold locks the funds,
+                # settle_against_hold debits them, then we credit the
+                # actor's wallet.
+                from ahp.economy.wallet import InsufficientFundsError
+                hold_id = f"survey:{request.survey_id}"
+                commons_wallet = broker.wallet(self._commons)
+                try:
+                    await commons_wallet.hold(
+                        hold_id=hold_id,
+                        amount=request.reward,
+                        reason=f"survey reward {request.survey_id}",
+                    )
+                    await commons_wallet.settle_against_hold(
+                        hold_id=hold_id,
+                        debit=request.reward,
+                        reason=f"survey payout {request.survey_id}",
+                    )
+                    await broker.wallet(request.surveyed_actor).topup(
+                        request.reward,
+                        reason=f"survey reward {request.survey_id}",
+                    )
+                except InsufficientFundsError:
+                    log.warning(
+                        "survey reward skipped: commons depleted "
+                        "(survey_id=%s, reward=%.4f)",
+                        request.survey_id, request.reward,
+                    )
+            except Exception:
+                log.exception(
+                    "survey wallet movement failed; record stands "
+                    "(survey_id=%s)", request.survey_id,
+                )
+
+        # CSAT update on the target server's reputation.
+        try:
+            from ahp.economy.reputation import apply_csat
+            rep = await broker.get_reputation(request.target_server)
+            if rep is None:
+                from ahp.economy.reputation import ReputationEntry
+                rep = ReputationEntry(owner=request.target_server)
+            updated = apply_csat(rep, response.score)
+            await broker.set_reputation(updated)
+        except Exception:
+            log.exception(
+                "survey CSAT update failed; record stands "
+                "(survey_id=%s)", request.survey_id,
+            )
+
+    async def _abandon(self, survey_id: str) -> None:
+        """Drop an expired request from the queue + request store.
+
+        Doesn't touch responses — if a response somehow already exists
+        it stays. The request blob goes because we don't want pending
+        surveys lingering past their TTL.
+        """
+        await self._redis.zrem(SURVEY_QUEUE_KEY, survey_id)
+        await self._redis.delete(
+            SURVEY_REQUEST_KEY.format(survey_id=survey_id)
+        )
+        log.info("survey expired and dropped: id=%s", survey_id)
+
+
+def _request_from_raw(raw: str | bytes) -> SurveyRequest:
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8")
+    data = json.loads(raw)
+    fields = SurveyRequest.__dataclass_fields__
+    return SurveyRequest(**{k: v for k, v in data.items() if k in fields})
+
+
+def response_from_raw(raw: str | bytes) -> SurveyResponse:
+    """Public so the CLI / broker can deserialize without reaching into
+    private helpers."""
+    if isinstance(raw, (bytes, bytearray)):
+        raw = raw.decode("utf-8")
+    data = json.loads(raw)
+    fields = SurveyResponse.__dataclass_fields__
+    return SurveyResponse(**{k: v for k, v in data.items() if k in fields})
 
 
 # ── exports ──────────────────────────────────────────────────────────

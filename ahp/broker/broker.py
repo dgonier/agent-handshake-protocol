@@ -26,6 +26,8 @@ host application's job; this is the protocol-level mechanism.
 from __future__ import annotations
 
 import json
+import logging
+import os
 import time
 from dataclasses import asdict
 from typing import Any
@@ -38,6 +40,12 @@ from ahp.broker.router import (
     Router,
 )
 from ahp.broker.server_registry import ServerMeta, ServerRegistry
+from ahp.broker.surveys import (
+    SurveyKind,
+    SurveyQueue,
+    SurveyRequest,
+    SurveyResponse,
+)
 from ahp.economy.agent_banker import BROKER_WALLET, COMMONS_WALLET, AgentBanker
 from ahp.economy.compute_provider import ComputeProvider, MenuLeaf
 from ahp.economy.pricing import (
@@ -57,7 +65,20 @@ from ahp.economy.tiers import Tier
 from ahp.economy.wallet import Wallet
 
 
+log = logging.getLogger("ahp.broker")
+
 REPUTATION_KEY = "ahp:reputation:{owner}"
+
+DEFAULT_SURVEY_STAKES_THRESHOLD: float = 5.0
+"""Settlement ``pre_tax`` above which the broker auto-enqueues a survey.
+
+Survey reward defaults to 5% of the settled ``pre_tax`` so a 10-credit
+interaction yields a 0.5-credit survey reward. Both knobs are
+overridable via env (``AHP_SURVEY_STAKES_THRESHOLD``,
+``AHP_SURVEY_REWARD_RATE``) so operators can tune without touching code.
+"""
+
+DEFAULT_SURVEY_REWARD_RATE: float = 0.05
 
 
 class Broker:
@@ -68,6 +89,7 @@ class Broker:
         self.servers = ServerRegistry(redis_client)
         self.compute = ComputeProviderRegistry(redis_client)
         self.banker = AgentBanker(redis_client)
+        self.surveys = SurveyQueue(redis_client)
         self.router = Router(
             server_registry=self.servers,
             compute_registry=self.compute,
@@ -353,4 +375,134 @@ class Broker:
             response_chars=response_chars,
             max_response_chars=max_response_chars,
         )
+
+        # Stakes-gated auto-survey. Only fires when the settlement
+        # cleared the threshold AND the target server has consented to
+        # surveys. Caller is the surveyed actor (they're the one who
+        # got the response and can judge usefulness).
+        await self._maybe_request_survey(
+            caller=caller,
+            server=server,
+            settlement=settlement,
+            hold_id=hold_id,
+        )
+
         return settlement
+
+    # ── surveys ──────────────────────────────────────────────────────
+
+    async def request_survey(
+        self,
+        *,
+        kind: SurveyKind,
+        target_server: str,
+        surveyed_actor: str,
+        recipe: str,
+        settlement_id: str,
+        reward: float,
+        delay_seconds: float = 300.0,
+        ttl_seconds: float = 86_400.0,
+    ) -> SurveyRequest | None:
+        """Public entry point to enqueue a survey.
+
+        Consults the target server's ``survey_opt_in`` flag — surveys
+        targeting an opted-out server are NOT enqueued, and this
+        returns ``None``. Returns the :class:`SurveyRequest` on
+        successful enqueue.
+
+        Idempotent re-enqueue (same ``settlement_id`` + same actor)
+        still produces a fresh ``survey_id`` because consent state may
+        have changed; callers wanting idempotency should pass a
+        pre-built request through :meth:`SurveyQueue.enqueue` directly.
+        """
+        meta = await self.servers.get(target_server)
+        if meta is not None and not meta.survey_opt_in:
+            log.info(
+                "skipping survey: target server %s opted out (survey_opt_in=False)",
+                target_server,
+            )
+            return None
+        # Pull consent snapshot for queue-time hint. Defaults match the
+        # ServerMeta defaults (csat_routing on, training off).
+        csat_at_queue = bool(meta.csat_routing_opt_in) if meta else True
+        train_at_queue = bool(meta.training_data_opt_in) if meta else False
+        request = SurveyRequest.new(
+            kind=kind,
+            target_server=target_server,
+            surveyed_actor=surveyed_actor,
+            recipe=recipe,
+            settlement_id=settlement_id,
+            reward=reward,
+            delay_seconds=delay_seconds,
+            ttl_seconds=ttl_seconds,
+        )
+        # Stamp the consent snapshot.
+        request = SurveyRequest(
+            survey_id=request.survey_id,
+            kind=request.kind,
+            target_server=request.target_server,
+            surveyed_actor=request.surveyed_actor,
+            recipe=request.recipe,
+            settlement_id=request.settlement_id,
+            reward=request.reward,
+            dispatch_at=request.dispatch_at,
+            expires_at=request.expires_at,
+            consent_csat_routing_at_queue=csat_at_queue,
+            consent_training_export_at_queue=train_at_queue,
+        )
+        await self.surveys.enqueue(request)
+        return request
+
+    async def submit_survey_response(
+        self,
+        response: SurveyResponse,
+    ) -> bool:
+        """Wallet + CSAT side effects fold into ``self``."""
+        return await self.surveys.submit_response(response, broker=self)
+
+    async def _maybe_request_survey(
+        self,
+        *,
+        caller: str,
+        server: ServerMeta,
+        settlement: Settlement,
+        hold_id: str,
+    ) -> None:
+        """Auto-enqueue a survey when settlement stakes warrant it.
+
+        Threshold + reward rate live in env so operators tune without
+        code changes. Errors are logged but never bubble — survey
+        enqueue failures must not undo a completed settlement.
+        """
+        try:
+            threshold = float(os.environ.get(
+                "AHP_SURVEY_STAKES_THRESHOLD",
+                str(DEFAULT_SURVEY_STAKES_THRESHOLD),
+            ))
+            reward_rate = float(os.environ.get(
+                "AHP_SURVEY_REWARD_RATE",
+                str(DEFAULT_SURVEY_REWARD_RATE),
+            ))
+        except ValueError:
+            threshold, reward_rate = (
+                DEFAULT_SURVEY_STAKES_THRESHOLD,
+                DEFAULT_SURVEY_REWARD_RATE,
+            )
+        if settlement.pre_tax < threshold:
+            return
+        reward = round(settlement.pre_tax * reward_rate, 6)
+        try:
+            await self.request_survey(
+                kind="post_settlement",
+                target_server=server.server_id,
+                surveyed_actor=caller,
+                recipe="post_settlement:csat",
+                settlement_id=hold_id,
+                reward=reward,
+            )
+        except Exception:
+            log.exception(
+                "auto-enqueue survey failed; settlement stands "
+                "(server=%s caller=%s hold_id=%s)",
+                server.server_id, caller, hold_id,
+            )

@@ -32,6 +32,7 @@ import importlib
 import os
 import sys
 import textwrap
+import time
 from pathlib import Path
 from typing import Sequence, TextIO
 
@@ -567,6 +568,154 @@ def cmd_register_agent(args: argparse.Namespace, out: TextIO) -> int:
     return asyncio.run(_register_agent_async(args, out))
 
 
+# ── surveys: list-surveys / vote ──────────────────────────────────────
+
+
+async def _list_surveys_async(args: argparse.Namespace, out: TextIO) -> int:
+    """List pending surveys from the broker queue.
+
+    Defaults to surveys whose ``dispatch_at`` has already passed.
+    ``--include-future`` shows queued-but-not-yet-due. ``--for ADDR``
+    filters to surveys targeting a specific surveyed actor.
+    """
+    from ahp.broker.surveys import SurveyQueue
+
+    client = _connect_redis(args.redis_url)
+    queue = SurveyQueue(client)
+    try:
+        pending = await queue.list_pending(
+            include_future=args.include_future,
+            surveyed_actor=args.for_addr,
+            limit=args.limit,
+        )
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+
+    if not pending:
+        print(
+            "(no pending surveys)"
+            if not args.for_addr
+            else f"(no pending surveys for {args.for_addr})",
+            file=out,
+        )
+        return 0
+
+    rows = [
+        (
+            req.survey_id[:12],
+            req.kind,
+            req.surveyed_actor,
+            req.target_server,
+            f"{req.reward:.4f}",
+            time.strftime("%H:%M:%S", time.localtime(req.dispatch_at)),
+        )
+        for req in pending
+    ]
+    _render_table(
+        out,
+        ["survey_id", "kind", "actor", "server", "reward", "due"],
+        rows,
+    )
+    return 0
+
+
+def cmd_list_surveys(args: argparse.Namespace, out: TextIO) -> int:
+    return asyncio.run(_list_surveys_async(args, out))
+
+
+async def _vote_async(args: argparse.Namespace, out: TextIO) -> int:
+    """Submit a :class:`SurveyResponse` for a queued survey.
+
+    The score is clamped to ``[0, 1]`` before submission; pass a value
+    in that range or use ``--score`` with a 1..5 scale and ``--scale``
+    will normalize for you. ``--allow-training`` records the
+    actor-consent-at-collection-time flag — defaults False because
+    training-data opt-in is intended to be explicit.
+
+    Wallet + CSAT side effects fold into the broker. On success this
+    prints the actor's new wallet balance (after the survey reward
+    credit).
+    """
+    from ahp.broker import Broker
+    from ahp.broker.surveys import SurveyResponse
+
+    score = float(args.score)
+    if args.scale == "1to5":
+        if not (1.0 <= score <= 5.0):
+            print(
+                f"score must be in [1, 5] when --scale 1to5 "
+                f"(got {score})",
+                file=sys.stderr,
+            )
+            return 2
+        score = (score - 1.0) / 4.0
+    elif args.scale == "zero_to_one":
+        if not (0.0 <= score <= 1.0):
+            print(
+                f"score must be in [0, 1] when --scale zero_to_one "
+                f"(got {score})",
+                file=sys.stderr,
+            )
+            return 2
+    else:  # pragma: no cover — argparse enforces
+        print(f"unknown scale {args.scale!r}", file=sys.stderr)
+        return 2
+
+    client = _connect_redis(args.redis_url)
+    broker = Broker(client)
+    try:
+        # Reach the queue's request record so we have target_server,
+        # actor, recipe, settlement_id — the response must echo them
+        # for the row to be useful later.
+        request = await broker.surveys.get_request(args.survey_id)
+        if request is None:
+            print(
+                f"no such survey: {args.survey_id!r}",
+                file=sys.stderr,
+            )
+            return 2
+        response = SurveyResponse(
+            survey_id=request.survey_id,
+            surveyed_actor=request.surveyed_actor,
+            target_server=request.target_server,
+            recipe=request.recipe,
+            settlement_id=request.settlement_id,
+            score=score,
+            free_text=args.free_text or "",
+            consent_csat_routing=not args.deny_csat,
+            consent_training_export=args.allow_training,
+        )
+        was_new = await broker.submit_survey_response(response)
+        if not was_new:
+            print(
+                f"survey {args.survey_id} already has a response on file",
+                file=sys.stderr,
+            )
+            return 2
+        balance = (await broker.wallet(
+            request.surveyed_actor,
+        ).get_state()).balance
+        print(
+            f"recorded vote for {args.survey_id}: "
+            f"score={score:.2f} actor={request.surveyed_actor} "
+            f"new_balance={balance:.4f}",
+            file=out,
+        )
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+    return 0
+
+
+def cmd_vote(args: argparse.Namespace, out: TextIO) -> int:
+    return asyncio.run(_vote_async(args, out))
+
+
 def cmd_start_agent(args: argparse.Namespace, out: TextIO) -> int:
     return asyncio.run(_start_agent_async(args, out))
 
@@ -805,6 +954,71 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_address_args(p_dereg_a)
     p_dereg_a.set_defaults(func=cmd_deregister_agent)
+
+    # list-surveys — read pending surveys from the broker queue
+    p_ls = sub.add_parser(
+        "list-surveys",
+        help="list pending surveys queued by the broker",
+    )
+    default_url = os.environ.get(
+        "AHP_REDIS_URL", "redis://localhost:6379/0",
+    )
+    p_ls.add_argument(
+        "--redis-url", default=default_url,
+        help=f"Redis URL (default: {default_url}, "
+             f"or $AHP_REDIS_URL when set)",
+    )
+    p_ls.add_argument(
+        "--for", dest="for_addr",
+        help="filter to surveys whose surveyed_actor is this address",
+    )
+    p_ls.add_argument(
+        "--include-future", action="store_true",
+        help="also list surveys whose dispatch_at is still in the future",
+    )
+    p_ls.add_argument(
+        "--limit", type=int, default=100,
+        help="max rows to return (default: 100)",
+    )
+    p_ls.set_defaults(func=cmd_list_surveys)
+
+    # vote — submit a SurveyResponse
+    p_vote = sub.add_parser(
+        "vote",
+        help="submit a response for a queued survey",
+    )
+    p_vote.add_argument(
+        "--redis-url", default=default_url,
+        help=f"Redis URL (default: {default_url})",
+    )
+    p_vote.add_argument(
+        "--survey-id", required=True,
+        help="survey_id from `ahp list-surveys`",
+    )
+    p_vote.add_argument(
+        "--score", required=True, type=float,
+        help="rating; range depends on --scale",
+    )
+    p_vote.add_argument(
+        "--scale", default="zero_to_one",
+        choices=["zero_to_one", "1to5"],
+        help="how to interpret --score (default: zero_to_one)",
+    )
+    p_vote.add_argument(
+        "--free-text", default="",
+        help="optional comment recorded with the response",
+    )
+    p_vote.add_argument(
+        "--allow-training", action="store_true",
+        help="record consent_training_export=True on this response "
+             "(default: False; training-data opt-in is explicit)",
+    )
+    p_vote.add_argument(
+        "--deny-csat", action="store_true",
+        help="record consent_csat_routing=False on this response "
+             "(default: consent is granted)",
+    )
+    p_vote.set_defaults(func=cmd_vote)
 
     return parser
 
