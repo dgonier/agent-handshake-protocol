@@ -29,10 +29,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib
+import json
+import logging
 import os
 import sys
 import textwrap
 import time
+
+log = logging.getLogger("ahp.cli")
 from pathlib import Path
 from typing import Sequence, TextIO
 
@@ -716,6 +720,311 @@ def cmd_vote(args: argparse.Namespace, out: TextIO) -> int:
     return asyncio.run(_vote_async(args, out))
 
 
+# ── tap / send / describe-agent ───────────────────────────────────────
+
+
+def _format_tap_line(message: Any) -> str:
+    """One terse line per tap message, e.g.::
+
+        2026-05-16T08:54:12  CAST  tifin.adv.science.astro.s.session.bull → *.adv.science.astro.*.*.*  cast.interview.text  body...
+    """
+    when = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(getattr(message, "sent_at", time.time()))
+    )
+    body = message.body
+    if isinstance(body, (dict, list)):
+        try:
+            body_repr = json.dumps(body, default=str)
+        except Exception:
+            body_repr = repr(body)
+    else:
+        body_repr = str(body)
+    if len(body_repr) > 80:
+        body_repr = body_repr[:77] + "..."
+    return (
+        f"{when}  {message.verb:8s}  "
+        f"{message.source} -> {message.target}  "
+        f"{message.code}  {body_repr}"
+    )
+
+
+async def _tap_async(args: argparse.Namespace, out: TextIO) -> int:
+    """Stream every message on the bus's tap channel, with filters."""
+    from ahp.core.codes import Code
+    from ahp.core.address import AgentAddress
+    from ahp.core.pattern import AddressPattern
+    from ahp.transport.redis_bus import RedisBus
+
+    # Build a client-side predicate from the filter args. We use the
+    # bus's predicate hook so we don't redundantly evaluate inside the
+    # CLI loop.
+    code_glob = args.code
+    src_pattern: AddressPattern | None = (
+        AddressPattern.parse(args.source) if args.source else None
+    )
+    tgt_pattern: AddressPattern | None = (
+        AddressPattern.parse(args.target) if args.target else None
+    )
+
+    def predicate(msg: Any) -> bool:
+        if code_glob and not Code.matches(msg.code, code_glob):
+            return False
+        if src_pattern is not None and not src_pattern.matches(msg.source):
+            return False
+        if tgt_pattern is not None:
+            t = msg.target
+            if isinstance(t, AgentAddress):
+                if not tgt_pattern.matches(t):
+                    return False
+            elif isinstance(t, AddressPattern):
+                # An outbound pattern is fuzzy; match if the two patterns
+                # share *any* match by comparing string forms exactly.
+                if str(t) != str(tgt_pattern):
+                    return False
+        return True
+
+    client = _connect_redis(args.redis_url)
+    bus = RedisBus(client)
+    seen = 0
+    try:
+        sub = await bus.tap_subscribe(
+            predicate=predicate if (
+                code_glob or src_pattern or tgt_pattern
+            ) else None,
+        )
+        print(
+            "tap: streaming bus events (Ctrl-C to stop)…",
+            file=out, flush=True,
+        )
+        async with sub:
+            async for msg in sub.messages(idle_timeout=0.5):
+                print(_format_tap_line(msg), file=out, flush=True)
+                seen += 1
+                if args.limit and seen >= args.limit:
+                    break
+    except asyncio.CancelledError:
+        pass
+    finally:
+        try:
+            await bus.close()
+        except Exception:
+            pass
+    return 0
+
+
+def cmd_tap(args: argparse.Namespace, out: TextIO) -> int:
+    try:
+        return asyncio.run(_tap_async(args, out))
+    except KeyboardInterrupt:
+        return 0
+
+
+# ── send ──────────────────────────────────────────────────────────────
+
+
+async def _send_async(args: argparse.Namespace, out: TextIO) -> int:
+    """Fire a one-off SEND or SEND-GET via :class:`ProtocolEngine`."""
+    from ahp.core import AddressPattern, Message
+    from ahp.core.address import AgentAddress
+    from ahp.core.compatibility import CompatibilityMatrix
+    from ahp.engine.router import ProtocolEngine
+    from ahp.registry.registry import AgentRegistry
+    from ahp.transport.cache import ProtocolCache
+    from ahp.transport.redis_bus import RedisBus
+
+    # Source defaults to a throwaway human address so we don't litter
+    # the registry; thread defaults to a fresh per-call id.
+    source = AgentAddress.parse(
+        args.source
+        or f"you.cli.x.y.s.ephemeral.send-{int(time.time()*1000)}"
+    )
+    target_str = args.target
+    target: Any
+    if "*" in target_str:
+        target = AddressPattern.parse(target_str)
+    else:
+        target = AgentAddress.parse(target_str)
+
+    # Try to parse body as JSON; fall back to raw string. Lets callers
+    # ship either: `--body '{"q": "hi"}'` or `--body "plain text"`.
+    body: Any
+    try:
+        body = json.loads(args.body)
+    except (json.JSONDecodeError, TypeError):
+        body = args.body
+
+    thread = args.thread or f"cli::send::{int(time.time()*1000)}"
+
+    client = _connect_redis(args.redis_url)
+    bus = RedisBus(client)
+    registry = AgentRegistry(client)
+    cache = ProtocolCache(client)
+    engine = ProtocolEngine(
+        bus, registry, cache, CompatibilityMatrix(),
+        default_timeout=args.timeout,
+    )
+
+    # Need a source address registered for SEND-GET so the engine can
+    # route the reply back. Register-then-deregister for the call's
+    # lifetime.
+    registered = False
+    if args.get:
+        try:
+            await registry.register(source)
+            registered = True
+        except Exception:
+            log.warning("could not register source address %s", source)
+
+    try:
+        verb = "SEND-GET" if args.get else "SEND"
+        msg = Message(
+            source=source, target=target,
+            code=args.code, verb=verb,
+            body=body, thread=thread,
+        )
+        result = await engine.handle(msg, timeout=args.timeout)
+        if args.get:
+            if result is None:
+                print("(no response within timeout)", file=out)
+                return 0
+            print(_format_tap_line(result), file=out)
+        else:
+            print(
+                f"sent to {target} (delivered to {result} subscriber(s))",
+                file=out,
+            )
+    finally:
+        if registered:
+            try:
+                await registry.deregister(source)
+            except Exception:
+                pass
+        try:
+            await bus.close()
+        except Exception:
+            pass
+    return 0
+
+
+def cmd_send(args: argparse.Namespace, out: TextIO) -> int:
+    return asyncio.run(_send_async(args, out))
+
+
+# ── describe-agent ────────────────────────────────────────────────────
+
+
+async def _describe_agent_async(args: argparse.Namespace, out: TextIO) -> int:
+    """Pretty-print everything we know about one agent.
+
+    Pulls four planes:
+      * registry: address, alive status, AgentMeta
+      * reputation: ReputationEntry from broker (if any)
+      * server binding: owning ServerMeta + best matching MenuLeaf
+      * (audit events sourced from the in-memory sink only when one is
+        wired into the running engine — not addressable from the CLI;
+        skipped here)
+    """
+    from ahp.broker import Broker
+    from ahp.core import AgentAddress
+    from ahp.economy.compute_provider import best_leaf
+    from ahp.registry.registry import AgentRegistry
+
+    try:
+        address = AgentAddress.parse(args.address)
+    except ValueError as exc:
+        print(f"invalid agent address: {exc}", file=sys.stderr)
+        return 2
+
+    client = _connect_redis(args.redis_url)
+    registry = AgentRegistry(client)
+    broker = Broker(client)
+    try:
+        meta = await registry.get(address)
+        alive = await registry.is_alive(address)
+
+        print(f"address:        {address}", file=out)
+        print(
+            f"status:         {'alive' if alive else 'stale or unknown'}",
+            file=out,
+        )
+
+        if meta is None:
+            print("(no registry metadata — agent is not registered)",
+                  file=out)
+            return 0
+
+        print(
+            f"capabilities:   {', '.join(meta.capabilities) if meta.capabilities else '-'}",
+            file=out,
+        )
+        print(f"reputation*:    {meta.reputation:.2f}    "
+              f"(*from AgentMeta; the broker tracks a richer record below)",
+              file=out)
+        if meta.description:
+            print(f"description:    {meta.description}", file=out)
+        if meta.health_endpoint:
+            print(f"health_endpt:   {meta.health_endpoint}", file=out)
+        if meta.extra:
+            print(f"extra:          {json.dumps(meta.extra, default=str)}",
+                  file=out)
+        if meta.registered_at:
+            print(
+                "registered:     "
+                + time.strftime(
+                    "%Y-%m-%dT%H:%M:%S",
+                    time.localtime(meta.registered_at),
+                ),
+                file=out,
+            )
+
+        # Broker plane — reputation + owning server.
+        rep = await broker.get_reputation(str(address))
+        if rep is not None:
+            print(file=out)
+            print("broker reputation:", file=out)
+            print(f"  reputation:   {rep.reputation:.3f}", file=out)
+            print(f"  completed:    {rep.completed_accepted}/{rep.completed_total}"
+                  f"  failed: {rep.failed}", file=out)
+            print(f"  csat:         {rep.csat:.3f}  ({rep.csat_samples} samples)",
+                  file=out)
+            print(f"  avg_latency:  {rep.avg_latency_ms:.0f}ms", file=out)
+            print(f"  avg_overage:  {rep.avg_overage:.3f}", file=out)
+
+        owning_servers = await broker.servers.discover(alive_only=False)
+        owning = next((s for s in owning_servers if s.org == address.org), None)
+        if owning is not None:
+            print(file=out)
+            print("owning server:", file=out)
+            print(f"  server_id:    {owning.server_id}", file=out)
+            print(f"  base_rate:    {owning.base_rate}", file=out)
+            print(f"  binding:      {owning.compute_binding}", file=out)
+            print(f"  rank_by:      {owning.compute_ranking}", file=out)
+            leaves = await broker.compute.list_leaves(only_alive_providers=True)
+            chosen = best_leaf(
+                owning.compute_binding, leaves,
+                rank_by=owning.compute_ranking,  # type: ignore[arg-type]
+            )
+            if chosen is not None:
+                print(
+                    f"  best leaf:    {chosen.address}  "
+                    f"@ {chosen.rate_per_1k_chars}/1k chars  "
+                    f"({chosen.latency_p95_ms:.0f}ms p95)",
+                    file=out,
+                )
+            else:
+                print("  best leaf:    (no matching live leaf)", file=out)
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+    return 0
+
+
+def cmd_describe_agent(args: argparse.Namespace, out: TextIO) -> int:
+    return asyncio.run(_describe_agent_async(args, out))
+
+
 def cmd_start_agent(args: argparse.Namespace, out: TextIO) -> int:
     return asyncio.run(_start_agent_async(args, out))
 
@@ -1019,6 +1328,90 @@ def build_parser() -> argparse.ArgumentParser:
              "(default: consent is granted)",
     )
     p_vote.set_defaults(func=cmd_vote)
+
+    # tap — live event stream
+    p_tap = sub.add_parser(
+        "tap",
+        help="live-stream the bus's tap channel (Ctrl-C to stop)",
+    )
+    p_tap.add_argument(
+        "--redis-url", default=default_url,
+        help=f"Redis URL (default: {default_url})",
+    )
+    p_tap.add_argument(
+        "--code",
+        help="filter to messages whose code matches this glob "
+             "(e.g. 'cast.interview.*', 'send.send_get.*')",
+    )
+    p_tap.add_argument(
+        "--source",
+        help="filter to messages whose source matches this AddressPattern",
+    )
+    p_tap.add_argument(
+        "--target",
+        help="filter to messages whose target matches this AddressPattern",
+    )
+    p_tap.add_argument(
+        "--limit", type=int, default=0,
+        help="stop after N matching messages (default: stream until Ctrl-C)",
+    )
+    p_tap.set_defaults(func=cmd_tap)
+
+    # send — one-off message
+    p_send = sub.add_parser(
+        "send",
+        help="send a one-off SEND (or SEND-GET with --get) message",
+    )
+    p_send.add_argument(
+        "--redis-url", default=default_url,
+        help=f"Redis URL (default: {default_url})",
+    )
+    p_send.add_argument(
+        "--target", required=True,
+        help="target AgentAddress or AddressPattern (e.g. "
+             "'tifin.researcher.x.y.s.session.alice' or "
+             "'*.researcher.*.*.*.*.*')",
+    )
+    p_send.add_argument(
+        "--code", required=True,
+        help="message code (e.g. 'send.send_get.interview.text')",
+    )
+    p_send.add_argument(
+        "--body", default="",
+        help="message body — parsed as JSON if it parses, otherwise "
+             "sent as a raw string",
+    )
+    p_send.add_argument(
+        "--source",
+        help="source AgentAddress (default: a fresh ephemeral CLI address)",
+    )
+    p_send.add_argument(
+        "--get", action="store_true",
+        help="use SEND-GET and print the response (default: fire-and-forget SEND)",
+    )
+    p_send.add_argument(
+        "--timeout", type=float, default=10.0,
+        help="--get timeout in seconds (default: 10)",
+    )
+    p_send.add_argument(
+        "--thread", help="thread id (default: a fresh per-call id)",
+    )
+    p_send.set_defaults(func=cmd_send)
+
+    # describe-agent — read-only per-agent view
+    p_desc = sub.add_parser(
+        "describe-agent",
+        help="show full per-agent state: registry, reputation, server, leaf",
+    )
+    p_desc.add_argument(
+        "address",
+        help="agent address URI (7 dot-separated fields)",
+    )
+    p_desc.add_argument(
+        "--redis-url", default=default_url,
+        help=f"Redis URL (default: {default_url})",
+    )
+    p_desc.set_defaults(func=cmd_describe_agent)
 
     return parser
 
