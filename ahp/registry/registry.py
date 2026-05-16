@@ -101,8 +101,22 @@ class AgentRegistry:
         self,
         address: AgentAddress,
         metadata: AgentMeta | None = None,
+        *,
+        mark_alive: bool = True,
     ) -> None:
-        """Register or update an agent. Also marks it live for ``heartbeat_ttl`` seconds.
+        """Register or update an agent's durable record.
+
+        With ``mark_alive=True`` (the default — preserves the
+        long-standing host-side behavior of "register == ready to
+        serve") the agent's liveness key is also set, making it
+        immediately visible to ``resolve(...)`` and ``is_alive(...)``.
+
+        With ``mark_alive=False``, only the durable hash entry is
+        written. The agent stays *invisible* until something calls
+        :meth:`heartbeat`. Use this from operator tooling that wants
+        to separate "claim this address" from "advertise as available"
+        — for example, the CLI's ``register agent`` (durable record)
+        vs ``start agent`` (visibility on the menu).
 
         Consults the active :class:`AuthPolicy`; raises
         :class:`UnauthorizedRegistrationError` if the principal isn't
@@ -121,8 +135,45 @@ class AgentRegistry:
         await self._redis.hset(
             Keys.registry_hash(), str(address), meta.to_json()
         )
-        await self._mark_alive(address)
+        if mark_alive:
+            await self._mark_alive(address)
         await self._emit("registry.register", address)
+
+    async def hide(self, address: AgentAddress) -> bool:
+        """Withdraw an agent from the menu without dropping its record.
+
+        Clears the liveness key so ``is_alive(addr)`` returns False and
+        pattern resolution (with the default ``alive_only=True``) no
+        longer surfaces this address — but the durable AgentMeta hash
+        entry stays. A subsequent :meth:`heartbeat` brings it back.
+
+        Returns True if the agent had a registry record (the visibility
+        flip is meaningful), False if it didn't (no-op).
+
+        Authorization: piggybacks on ``can_deregister`` — hiding is a
+        weaker form of deregistration. If a policy lets a principal
+        deregister, it lets them hide. If it doesn't, hiding is also
+        denied.
+        """
+        if not self._policy.can_deregister(self._principal, address):
+            await self._emit(
+                "registry.hide", address, success=False,
+                error="UnauthorizedRegistrationError",
+            )
+            raise UnauthorizedRegistrationError(
+                f"principal {self._principal.id if self._principal else '<anonymous>'!r} "
+                f"is not authorized to hide {address}"
+            )
+        exists = await self._redis.hexists(Keys.registry_hash(), str(address))
+        if not exists:
+            await self._emit(
+                "registry.hide", address, success=False,
+                error="NotRegistered",
+            )
+            return False
+        await self._redis.delete(Keys.alive_key(address))
+        await self._emit("registry.hide", address)
+        return True
 
     async def deregister(self, address: AgentAddress) -> None:
         """Remove an agent and its liveness marker.

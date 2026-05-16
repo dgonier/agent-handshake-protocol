@@ -377,6 +377,208 @@ def cmd_list_agents(args: argparse.Namespace, out: TextIO) -> int:
     return asyncio.run(_list_agents_async(args, out))
 
 
+# ── new / register / start / stop / deregister ────────────────────────
+
+
+def _build_address(args: argparse.Namespace) -> AgentAddress:
+    """Compose an :class:`AgentAddress` from the registration-command args.
+
+    Used by ``register``, ``start``, ``stop``, and ``deregister``.
+    Centralized so the seven-field convention stays consistent and
+    error messages cite the same defaults everywhere.
+    """
+    name = args.name.strip().lower().replace("-", "_").replace(" ", "_")
+    return AgentAddress.parse(
+        f"{args.scope}.{args.role}.{args.domain}.{args.subdomain}."
+        f"{args.accept}.{args.lifecycle}.{name}"
+    )
+
+
+def cmd_new(args: argparse.Namespace, out: TextIO) -> int:
+    """Top-level dispatcher for ``ahp new <kind>``.
+
+    Routes to one of three scaffolders. The first positional is the
+    kind (``tool``, ``integration``, ``agent``); the rest of the args
+    are kind-specific.
+    """
+    from ahp import scaffolders
+    try:
+        if args.kind == "tool":
+            path = scaffolders.scaffold_tool(
+                name=scaffolders.normalize_name(args.name),
+                scope=args.scope, kind=args.tool_kind,
+                role=args.role, category=args.category,
+                signature=args.signature or "query: str",
+                summary=args.summary,
+                out_dir=Path(args.path) if args.path else None,
+                force=args.force,
+            )
+        elif args.kind == "integration":
+            path = scaffolders.scaffold_integration(
+                name=scaffolders.normalize_name(args.name),
+                kind=args.type,
+                scope=args.scope,
+                out_dir=Path(args.path) if args.path else None,
+                force=args.force,
+            )
+        elif args.kind == "agent":
+            path = scaffolders.scaffold_agent(
+                name=scaffolders.normalize_name(args.name),
+                kind=args.type,
+                scope=args.scope, role=args.role,
+                out_dir=Path(args.path) if args.path else None,
+                force=args.force,
+            )
+        else:  # pragma: no cover — argparse enforces choices
+            print(f"unknown new kind: {args.kind!r}", file=sys.stderr)
+            return 2
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except FileExistsError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(f"wrote {path}", file=out)
+    return 0
+
+
+async def _register_agent_async(args: argparse.Namespace, out: TextIO) -> int:
+    """``ahp register agent`` — write the durable AgentMeta record.
+
+    Does NOT mark alive. The agent stays invisible to pattern
+    resolution until ``ahp start agent`` flips its heartbeat. Use this
+    so durable claim is separable from menu visibility — matching the
+    broker-as-source-of-truth model.
+    """
+    from ahp.registry.registry import AgentMeta, AgentRegistry
+    try:
+        address = _build_address(args)
+    except ValueError as exc:
+        print(f"invalid agent address: {exc}", file=sys.stderr)
+        return 2
+    meta = AgentMeta(
+        capabilities=list(args.capability or []),
+        description=args.description,
+    )
+    client = _connect_redis(args.redis_url)
+    registry = AgentRegistry(client)
+    try:
+        await registry.register(address, meta, mark_alive=False)
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+    print(f"registered {address}", file=out)
+    return 0
+
+
+async def _start_agent_async(args: argparse.Namespace, out: TextIO) -> int:
+    """``ahp start agent`` — mark visible on the menu.
+
+    Sets the liveness key on a previously-registered agent. The agent's
+    process (wherever it's hosted) continues to run untouched; this is
+    purely a broker-side advertise flip.
+    """
+    from ahp.registry.registry import AgentRegistry
+    try:
+        address = _build_address(args)
+    except ValueError as exc:
+        print(f"invalid agent address: {exc}", file=sys.stderr)
+        return 2
+    client = _connect_redis(args.redis_url)
+    registry = AgentRegistry(client)
+    try:
+        ok = await registry.heartbeat(address)
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+    if not ok:
+        print(
+            f"no record for {address} — run "
+            f"`ahp register agent ...` first",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"visible: {address}", file=out)
+    return 0
+
+
+async def _stop_agent_async(args: argparse.Namespace, out: TextIO) -> int:
+    """``ahp stop agent`` — hide from the menu, keep the durable record.
+
+    The agent process may still be running; this only clears the
+    liveness key. Bring it back later with ``ahp start agent``.
+    """
+    from ahp.registry.registry import AgentRegistry
+    try:
+        address = _build_address(args)
+    except ValueError as exc:
+        print(f"invalid agent address: {exc}", file=sys.stderr)
+        return 2
+    client = _connect_redis(args.redis_url)
+    registry = AgentRegistry(client)
+    try:
+        had_record = await registry.hide(address)
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+    if not had_record:
+        print(
+            f"no record for {address} (nothing to hide)",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"hidden: {address}", file=out)
+    return 0
+
+
+async def _deregister_agent_async(args: argparse.Namespace, out: TextIO) -> int:
+    """``ahp deregister agent`` — remove the record entirely.
+
+    Strong form of stop: drops the durable AgentMeta AND the liveness
+    key. The agent must re-``register`` before it can be made visible
+    again.
+    """
+    from ahp.registry.registry import AgentRegistry
+    try:
+        address = _build_address(args)
+    except ValueError as exc:
+        print(f"invalid agent address: {exc}", file=sys.stderr)
+        return 2
+    client = _connect_redis(args.redis_url)
+    registry = AgentRegistry(client)
+    try:
+        await registry.deregister(address)
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+    print(f"deregistered {address}", file=out)
+    return 0
+
+
+def cmd_register_agent(args: argparse.Namespace, out: TextIO) -> int:
+    return asyncio.run(_register_agent_async(args, out))
+
+
+def cmd_start_agent(args: argparse.Namespace, out: TextIO) -> int:
+    return asyncio.run(_start_agent_async(args, out))
+
+
+def cmd_stop_agent(args: argparse.Namespace, out: TextIO) -> int:
+    return asyncio.run(_stop_agent_async(args, out))
+
+
+def cmd_deregister_agent(args: argparse.Namespace, out: TextIO) -> int:
+    return asyncio.run(_deregister_agent_async(args, out))
+
+
 # ── argparse setup ────────────────────────────────────────────────────
 
 
@@ -456,6 +658,153 @@ def build_parser() -> argparse.ArgumentParser:
     p_sc.add_argument("-f", "--force", action="store_true",
                       help="overwrite the destination if it exists")
     p_sc.set_defaults(func=cmd_scaffold)
+
+    # new <kind> — Django-style project scaffolder
+    p_new = sub.add_parser(
+        "new",
+        help="scaffold a new tool, integration, or agent into the project tree",
+    )
+    new_sub = p_new.add_subparsers(dest="kind", required=True)
+
+    # new tool
+    p_new_tool = new_sub.add_parser(
+        "tool", help="write ./tools/<name>.py — a @tool-decorated stub"
+    )
+    p_new_tool.add_argument("--name", required=True,
+                            help="tool function name (snake_case)")
+    p_new_tool.add_argument("--scope", default="tifin")
+    p_new_tool.add_argument("--tool-kind", dest="tool_kind", default="api",
+                            help="tool address `kind` field (api, db, fs, ...)")
+    p_new_tool.add_argument("--role", default="*",
+                            help="tool address `role` field — default `*` "
+                                 "(any role in scope can use it)")
+    p_new_tool.add_argument("--category", default="search",
+                            help="tool address `category` field")
+    p_new_tool.add_argument("--signature",
+                            help="Python signature for the function body, "
+                                 "e.g. 'query: str, top_k: int = 5'")
+    p_new_tool.add_argument("--summary",
+                            help="one-line docstring for the generated function")
+    p_new_tool.add_argument("--path",
+                            help="project root override (default: cwd)")
+    p_new_tool.add_argument("-f", "--force", action="store_true",
+                            help="overwrite if the target file exists")
+    p_new_tool.set_defaults(func=cmd_new)
+
+    # new integration
+    p_new_int = new_sub.add_parser(
+        "integration",
+        help="write ./integrations/<name>.py — external-service wrapper",
+    )
+    p_new_int.add_argument("--name", required=True,
+                           help="integration name (snake_case)")
+    p_new_int.add_argument("--type", default="api_key",
+                           choices=["api_key", "oauth", "webhook"],
+                           help="auth pattern; oauth scaffold is "
+                                "intentionally a stub")
+    p_new_int.add_argument("--scope", default="tifin")
+    p_new_int.add_argument("--path",
+                           help="project root override (default: cwd)")
+    p_new_int.add_argument("-f", "--force", action="store_true",
+                           help="overwrite if the target file exists")
+    p_new_int.set_defaults(func=cmd_new)
+
+    # new agent
+    p_new_agent = new_sub.add_parser(
+        "agent",
+        help="write ./agents/<name>.py — a runnable agent module",
+    )
+    p_new_agent.add_argument("--name", required=True,
+                             help="agent name (snake_case)")
+    p_new_agent.add_argument("--type", default="simple",
+                             choices=["simple", "react", "deepagent"],
+                             help="framework for the agent body")
+    p_new_agent.add_argument("--scope", default="tifin")
+    p_new_agent.add_argument("--role", default="researcher")
+    p_new_agent.add_argument("--path",
+                             help="project root override (default: cwd)")
+    p_new_agent.add_argument("-f", "--force", action="store_true",
+                             help="overwrite if the target file exists")
+    p_new_agent.set_defaults(func=cmd_new)
+
+    # register / start / stop / deregister — share the address-build args
+    def _add_address_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--name", required=True,
+                       help="agent instance name (snake_case)")
+        p.add_argument("--scope", default="tifin",
+                       help="agent address `org` field (a.k.a. scope)")
+        p.add_argument("--role", default="researcher")
+        p.add_argument("--domain", default="example")
+        p.add_argument("--subdomain", default="example")
+        p.add_argument("--accept", default="s",
+                       help="accept-tier glob; `s` matches structured text")
+        p.add_argument("--lifecycle", default="session",
+                       help="session | longterm | ephemeral | stale-ok")
+        default_url = os.environ.get(
+            "AHP_REDIS_URL", "redis://localhost:6379/0",
+        )
+        p.add_argument(
+            "--redis-url", default=default_url,
+            help=f"Redis URL (default: {default_url}, "
+                 f"or $AHP_REDIS_URL when set)",
+        )
+
+    # register agent — durable record only
+    p_reg = sub.add_parser(
+        "register",
+        help="durable agent registration (does NOT make visible)",
+    )
+    reg_sub = p_reg.add_subparsers(dest="entity", required=True)
+    p_reg_a = reg_sub.add_parser(
+        "agent",
+        help="write the durable AgentMeta to Redis; agent stays hidden "
+             "until `ahp start agent` flips its heartbeat",
+    )
+    _add_address_args(p_reg_a)
+    p_reg_a.add_argument("--capability", action="append", default=[],
+                         help="tag this agent with a capability "
+                              "(may be repeated)")
+    p_reg_a.add_argument("--description", help="short human description")
+    p_reg_a.set_defaults(func=cmd_register_agent)
+
+    # start agent — make visible
+    p_start = sub.add_parser(
+        "start",
+        help="advertise a registered agent on the menu (broker-side)",
+    )
+    start_sub = p_start.add_subparsers(dest="entity", required=True)
+    p_start_a = start_sub.add_parser(
+        "agent",
+        help="heartbeat a registered agent so pattern resolution finds it",
+    )
+    _add_address_args(p_start_a)
+    p_start_a.set_defaults(func=cmd_start_agent)
+
+    # stop agent — hide
+    p_stop = sub.add_parser(
+        "stop",
+        help="hide an agent from the menu (the agent process keeps running)",
+    )
+    stop_sub = p_stop.add_subparsers(dest="entity", required=True)
+    p_stop_a = stop_sub.add_parser(
+        "agent",
+        help="clear an agent's heartbeat (keeps the durable record)",
+    )
+    _add_address_args(p_stop_a)
+    p_stop_a.set_defaults(func=cmd_stop_agent)
+
+    # deregister agent — remove the record entirely
+    p_dereg = sub.add_parser(
+        "deregister",
+        help="remove an agent's durable record (strong form of stop)",
+    )
+    dereg_sub = p_dereg.add_subparsers(dest="entity", required=True)
+    p_dereg_a = dereg_sub.add_parser(
+        "agent",
+        help="drop the AgentMeta hash entry AND the heartbeat key",
+    )
+    _add_address_args(p_dereg_a)
+    p_dereg_a.set_defaults(func=cmd_deregister_agent)
 
     return parser
 
