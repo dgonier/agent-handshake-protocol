@@ -1,28 +1,36 @@
 """ReAct agent adapter.
 
-Wraps ``langgraph.prebuilt.create_react_agent`` so an :class:`AgentProfile`
-+ a chat model produces an :class:`AHPAgent` ready to plug into the
-protocol.
+Wraps ``langchain.agents.create_agent`` (the LangChain v1 ReAct loop
+that superseded ``langgraph.prebuilt.create_react_agent``) so an
+:class:`AgentProfile` + a chat model produces an :class:`AHPAgent`
+ready to plug into the protocol.
 
 Profile → ReAct mapping:
 
 * ``profile.all_tools`` are converted to LangChain ``StructuredTool``
   instances (the protocol's :class:`Tool` is intentionally minimal;
   this adapter performs the translation).
-* ``profile.prompt`` becomes the system prompt passed to
-  ``create_react_agent``.
+* ``profile.prompt`` becomes the ``system_prompt`` passed to
+  ``create_agent``.
 * The agent's inbox messages enter the graph as a single
   ``HumanMessage``; the last AI message in the resulting state becomes
   the reply body.
+
+History note: this adapter previously used
+``langgraph.prebuilt.create_react_agent`` (deprecated in LangGraph v1
+in favor of LangChain's ``create_agent``). The output state shape is
+the same — the keyword that names the system prompt changed
+(``prompt=`` → ``system_prompt=``) and the import moved from
+``langgraph.prebuilt`` to ``langchain.agents``.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from langchain.agents import create_agent
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import StructuredTool
-from langgraph.prebuilt import create_react_agent
 
 from ahp.adapters.capability import AgentProfile, Tool
 from ahp.adapters.langgraph_agent import LangGraphAgent
@@ -125,10 +133,10 @@ class ReactAgent(LangGraphAgent):
         if extra_tools:
             tools_in.extend(extra_tools)
         lc_tools = [_to_langchain_tool(t) for t in tools_in]
-        graph = create_react_agent(
+        graph = create_agent(
             model=model,
             tools=lc_tools,
-            prompt=profile.prompt or None,
+            system_prompt=profile.prompt or None,
         )
         return cls(
             address=address,
