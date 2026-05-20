@@ -17,11 +17,13 @@ from typing import TYPE_CHECKING, Any
 
 from ahp.audit.event import AuditEvent
 from ahp.audit.sinks import (
+    DEFAULT_REDIS_AUDIT_STREAM,
     AuditSink,
     InMemoryAuditSink,
     LoggingAuditSink,
     MultiSink,
     NullAuditSink,
+    RedisStreamAuditSink,
 )
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -40,9 +42,11 @@ def __getattr__(name: str) -> Any:
 __all__ = [
     "AuditEvent",
     "AuditSink",
+    "DEFAULT_REDIS_AUDIT_STREAM",
     "InMemoryAuditSink",
     "LoggingAuditSink",
     "MultiSink",
     "NullAuditSink",
+    "RedisStreamAuditSink",
     "CloudWatchLogsSink",
 ]

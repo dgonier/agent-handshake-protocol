@@ -32,6 +32,7 @@ import time
 from dataclasses import asdict
 from typing import Any
 
+from ahp.audit import AuditEvent, AuditSink
 from ahp.broker.compute_registry import ComputeProviderRegistry
 from ahp.broker.router import (
     NoCandidatesError,
@@ -84,28 +85,71 @@ DEFAULT_SURVEY_REWARD_RATE: float = 0.05
 class Broker:
     """Top-level facade for the routing + settlement broker."""
 
-    def __init__(self, redis_client: Any) -> None:
+    def __init__(
+        self,
+        redis_client: Any,
+        *,
+        audit: AuditSink | None = None,
+    ) -> None:
         self._redis = redis_client
+        self._audit = audit
         self.servers = ServerRegistry(redis_client)
         self.compute = ComputeProviderRegistry(redis_client)
         self.banker = AgentBanker(redis_client)
-        self.surveys = SurveyQueue(redis_client)
+        self.surveys = SurveyQueue(redis_client, audit=audit)
         self.router = Router(
             server_registry=self.servers,
             compute_registry=self.compute,
             reputation_lookup=self.get_reputation,
         )
 
+    async def _emit(
+        self,
+        op: str,
+        *,
+        target: str | None = None,
+        success: bool = True,
+        error: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Best-effort audit emission. Never raises."""
+        if self._audit is None:
+            return
+        try:
+            await self._audit.emit(AuditEvent(
+                op=op, target=target,
+                success=success, error=error,
+                extra=extra or {},
+            ))
+        except Exception:
+            log.exception("audit emit failed for op=%s", op)
+
     # ── server lifecycle ──────────────────────────────────────────────
 
     async def register_server(self, meta: ServerMeta) -> None:
         await self.servers.register(meta)
+        await self._emit(
+            "broker.server.register",
+            target=meta.server_id,
+            extra={
+                "org": meta.org, "base_rate": meta.base_rate,
+                "binding": meta.compute_binding,
+            },
+        )
 
     async def deregister_server(self, server_id: str) -> None:
         await self.servers.deregister(server_id)
+        await self._emit("broker.server.deregister", target=server_id)
 
     async def heartbeat_server(self, server_id: str) -> bool:
-        return await self.servers.heartbeat(server_id)
+        ok = await self.servers.heartbeat(server_id)
+        await self._emit(
+            "broker.server.heartbeat",
+            target=server_id,
+            success=ok,
+            error=None if ok else "NotRegistered",
+        )
+        return ok
 
     # ── compute provider lifecycle ────────────────────────────────────
 
@@ -124,6 +168,11 @@ class Broker:
         registration is also the first heartbeat.
         """
         await self.compute.register_provider(provider, prove_alive=prove_alive)
+        await self._emit(
+            "broker.provider.register",
+            target=provider.provider_id,
+            extra={"prove_alive": prove_alive},
+        )
 
     async def deregister_compute_provider(
         self,
@@ -135,12 +184,34 @@ class Broker:
         on the next ``check_compute_outages()`` sweep, in case the
         watchdog has detected the provider failed without saying so."""
         await self.compute.deregister_provider(provider_id, graceful=graceful)
+        await self._emit(
+            "broker.provider.deregister",
+            target=provider_id,
+            extra={"graceful": graceful},
+        )
 
     async def heartbeat_compute_provider(self, provider_id: str) -> bool:
-        return await self.compute.heartbeat_provider(provider_id)
+        ok = await self.compute.heartbeat_provider(provider_id)
+        await self._emit(
+            "broker.provider.heartbeat",
+            target=provider_id,
+            success=ok,
+            error=None if ok else "NotRegistered",
+        )
+        return ok
 
     async def register_leaf(self, leaf: MenuLeaf) -> None:
         await self.compute.register_leaf(leaf)
+        await self._emit(
+            "broker.leaf.register",
+            target=leaf.address,
+            extra={
+                "provider": leaf.provider_id, "tier": leaf.tier,
+                "model": leaf.model,
+                "rate_per_1k_chars": leaf.rate_per_1k_chars,
+                "latency_p95_ms": leaf.latency_p95_ms,
+            },
+        )
 
     async def check_compute_outages(self) -> list[str]:
         """Detect and credit any unplanned-outage events for compute
@@ -163,6 +234,11 @@ class Broker:
                     max_response_chars=0,
                 )
                 hit.append(provider.provider_id)
+                await self._emit(
+                    "broker.provider.outage",
+                    target=provider.provider_id,
+                    success=False, error="UnplannedDeregister",
+                )
         return hit
 
     # ── routing ──────────────────────────────────────────────────────
@@ -374,6 +450,24 @@ class Broker:
             latency_ms=actual_latency_ms,
             response_chars=response_chars,
             max_response_chars=max_response_chars,
+        )
+
+        await self._emit(
+            "broker.settlement",
+            target=server.server_id,
+            extra={
+                "caller": caller,
+                "hold_id": hold_id,
+                "leaf": leaf.address if leaf is not None else None,
+                "pre_tax": round(float(settlement.pre_tax), 6),
+                "to_server": round(float(settlement.to_server), 6),
+                "to_compute": round(float(settlement.to_compute), 6),
+                "to_broker": round(float(settlement.to_broker), 6),
+                "to_commons": round(float(settlement.to_commons), 6),
+                "effective_chars": int(settlement.effective_chars),
+                "actual_latency_ms": round(float(actual_latency_ms), 2),
+                "tier_verdict": tier_verdict,
+            },
         )
 
         # Stakes-gated auto-survey. Only fires when the settlement
