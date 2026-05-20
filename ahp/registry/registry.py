@@ -230,6 +230,62 @@ class AgentRegistry:
             return None
         return AgentMeta.from_json(raw)
 
+    async def update_reputation(
+        self,
+        address: AgentAddress,
+        delta: float,
+    ) -> AgentMeta | None:
+        """Apply ``delta`` to the agent's :attr:`AgentMeta.reputation`.
+
+        Clamps the result to ``[0.0, 1.0]``. Returns the updated meta
+        on success, or ``None`` if the agent isn't registered.
+
+        CAS via WATCH/MULTI/EXEC so concurrent settlements against the
+        same agent don't lose each other's nudges — same retry pattern
+        as the wallet primitives. The retry loop is bounded; if it
+        exhausts (extremely unlikely at our concurrency levels), we
+        return the last-read state without writing.
+
+        Settlement signal mapping (broker convention; not enforced
+        here):
+        * accepted outcome → +``REP_REWARD_SUCCESS`` (≈ +0.005)
+        * sub_tier / timeout / refund → -``REP_PENALTY_FAILURE`` (≈ -0.05)
+
+        The asymmetric magnitudes match the server-level
+        :class:`ReputationEntry` updates so the two reputation tracks
+        evolve at comparable rates.
+        """
+        key = Keys.registry_hash()
+        addr_str = str(address)
+        for _ in range(8):
+            async with self._redis.pipeline(transaction=True) as pipe:
+                await pipe.watch(key)
+                raw = await self._redis.hget(key, addr_str)
+                if raw is None:
+                    await pipe.unwatch()
+                    await self._emit(
+                        "registry.update_reputation", address,
+                        success=False, error="NotRegistered",
+                    )
+                    return None
+                meta = AgentMeta.from_json(raw)
+                meta.reputation = max(
+                    0.0, min(1.0, meta.reputation + float(delta))
+                )
+                pipe.multi()
+                pipe.hset(key, addr_str, meta.to_json())
+                results = await pipe.execute()
+                if results is not None:
+                    await self._emit("registry.update_reputation", address)
+                    return meta
+        # CAS retries exhausted — return what we last read but don't
+        # claim a successful update.
+        await self._emit(
+            "registry.update_reputation", address,
+            success=False, error="CASRetryExhausted",
+        )
+        return None
+
     async def count(self, *, alive_only: bool = False) -> int:
         if not alive_only:
             return await self._redis.hlen(Keys.registry_hash())

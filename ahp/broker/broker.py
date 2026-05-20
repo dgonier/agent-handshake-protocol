@@ -90,9 +90,26 @@ class Broker:
         redis_client: Any,
         *,
         audit: AuditSink | None = None,
+        registry: Any = None,
     ) -> None:
+        """Construct the broker facade.
+
+        ``registry`` is an optional :class:`~ahp.registry.AgentRegistry`
+        reference. When wired, the broker feeds settlement signal back
+        into per-agent :attr:`AgentMeta.reputation` after each
+        successful settlement — accepted outcomes nudge the responder's
+        reputation up, failures (sub_tier, timeout, refund) nudge it
+        down. Same asymmetric magnitudes as the server-level
+        :class:`ReputationEntry`.
+
+        Without a registry the broker still functions; the per-agent
+        ``AgentMeta.reputation`` field just stays at its default. The
+        server-level reputation (``ahp:reputation:<server_id>``) is
+        always tracked because it's the routing signal.
+        """
         self._redis = redis_client
         self._audit = audit
+        self._registry = registry
         self.servers = ServerRegistry(redis_client)
         self.compute = ComputeProviderRegistry(redis_client)
         self.banker = AgentBanker(redis_client)
@@ -401,6 +418,7 @@ class Broker:
         actual_latency_ms: float,
         completed_with_caller: int,
         tier_verdict: str = "matched",
+        responder: Any = None,
     ) -> Settlement:
         """Compute the settlement, apply it, and update reputation.
 
@@ -410,6 +428,10 @@ class Broker:
             2. Calls :func:`settle_payment` to get the four-way split.
             3. Atomically credits all four wallets via :meth:`settle`.
             4. Updates the server's reputation record.
+            5. If a registry was wired at construction and ``responder``
+               is supplied, nudges the responding agent's
+               :attr:`AgentMeta.reputation` by the same asymmetric
+               magnitudes used at the server tier.
 
         Returns the :class:`Settlement` so the engine / audit can
         record it.
@@ -451,6 +473,26 @@ class Broker:
             response_chars=response_chars,
             max_response_chars=max_response_chars,
         )
+
+        # Per-agent reputation feedback. The responder is the agent
+        # whose response triggered this settlement; nudge AgentMeta.
+        # reputation in the registry so per-agent rep evolves over
+        # time alongside the server tier.
+        if responder is not None and self._registry is not None:
+            from ahp.economy.reputation import (
+                REP_PENALTY_FAILURE, REP_REWARD_SUCCESS,
+            )
+            delta = (
+                REP_REWARD_SUCCESS if outcome == "accepted"
+                else -REP_PENALTY_FAILURE
+            )
+            try:
+                await self._registry.update_reputation(responder, delta)
+            except Exception:
+                log.exception(
+                    "agent reputation nudge failed; settlement stands "
+                    "(responder=%s)", responder,
+                )
 
         await self._emit(
             "broker.settlement",

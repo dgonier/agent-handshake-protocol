@@ -283,6 +283,7 @@ class RecordingBroker:
         actual_latency_ms: float,
         completed_with_caller: int,
         tier_verdict: str = "matched",
+        responder: Any = None,
     ) -> Any:
         settlement = await self._inner.calculate_and_settle(
             caller=caller, hold_id=hold_id,
@@ -292,6 +293,7 @@ class RecordingBroker:
             actual_latency_ms=actual_latency_ms,
             completed_with_caller=completed_with_caller,
             tier_verdict=tier_verdict,
+            responder=responder,
         )
         try:
             self.settlements.append({
