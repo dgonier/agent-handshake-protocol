@@ -720,6 +720,94 @@ def cmd_vote(args: argparse.Namespace, out: TextIO) -> int:
     return asyncio.run(_vote_async(args, out))
 
 
+# ── fire-surveys / export-surveys ─────────────────────────────────────
+
+
+async def _fire_surveys_async(args: argparse.Namespace, out: TextIO) -> int:
+    """Dispatch ready surveys to their surveyed actors.
+
+    Reads from the same queue as ``list-surveys``. With ``--dry-run``
+    just reports what would fire; without, sends a ``Code.HUMAN_OBSERVE``
+    SEND message per ready survey via the bus. Idempotent — a
+    survey is only fired once until its response is submitted.
+    """
+    from ahp.broker import Broker
+    from ahp.transport.redis_bus import RedisBus
+
+    client = _connect_redis(args.redis_url)
+    broker = Broker(client)
+    bus = RedisBus(client)
+    try:
+        if args.dry_run:
+            dispatched = await broker.surveys.fire_due(bus=None)
+            mode = "dry-run"
+        else:
+            dispatched = await broker.surveys.fire_due(
+                bus=bus, max_dispatch=args.limit,
+            )
+            mode = "fired"
+        if not dispatched:
+            print(f"({mode}: no ready surveys)", file=out)
+            return 0
+        for req in dispatched:
+            print(
+                f"{mode}  {req.survey_id[:12]}  "
+                f"actor={req.surveyed_actor}  "
+                f"server={req.target_server}  "
+                f"reward={req.reward:.4f}",
+                file=out,
+            )
+    finally:
+        try:
+            await bus.close()
+        except Exception:
+            pass
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+    return 0
+
+
+def cmd_fire_surveys(args: argparse.Namespace, out: TextIO) -> int:
+    return asyncio.run(_fire_surveys_async(args, out))
+
+
+async def _export_surveys_async(args: argparse.Namespace, out: TextIO) -> int:
+    """Dump consenting :class:`SurveyResponse` rows to a JSONL file."""
+    from ahp.broker.surveys import export_corpus, write_corpus_jsonl
+
+    client = _connect_redis(args.redis_url)
+    try:
+        if args.out:
+            count = await write_corpus_jsonl(
+                client, args.out,
+                since=args.since, anonymize=not args.no_anonymize,
+            )
+            print(
+                f"wrote {count} row(s) to {args.out} "
+                f"(since={args.since}, anonymize={not args.no_anonymize})",
+                file=out,
+            )
+        else:
+            rows = await export_corpus(
+                client, since=args.since, anonymize=not args.no_anonymize,
+            )
+            from dataclasses import asdict as _asdict
+            for row in rows:
+                print(json.dumps(_asdict(row), default=str), file=out)
+    finally:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+    return 0
+
+
+def cmd_export_surveys(args: argparse.Namespace, out: TextIO) -> int:
+    return asyncio.run(_export_surveys_async(args, out))
+
+
 # ── tap / send / describe-agent ───────────────────────────────────────
 
 
@@ -1481,6 +1569,50 @@ def build_parser() -> argparse.ArgumentParser:
              "(default: consent is granted)",
     )
     p_vote.set_defaults(func=cmd_vote)
+
+    # fire-surveys — dispatch ready surveys to surveyed actors
+    p_fs = sub.add_parser(
+        "fire-surveys",
+        help="dispatch ready surveys as HUMAN_OBSERVE messages on the bus",
+    )
+    p_fs.add_argument(
+        "--redis-url", default=default_url,
+        help=f"Redis URL (default: {default_url})",
+    )
+    p_fs.add_argument(
+        "--dry-run", action="store_true",
+        help="report what would be dispatched without sending anything",
+    )
+    p_fs.add_argument(
+        "--limit", type=int, default=50,
+        help="max surveys to dispatch in this sweep (default: 50)",
+    )
+    p_fs.set_defaults(func=cmd_fire_surveys)
+
+    # export-surveys — consenting training-data rows as JSONL
+    p_es = sub.add_parser(
+        "export-surveys",
+        help="export consenting survey responses as JSONL training data",
+    )
+    p_es.add_argument(
+        "--redis-url", default=default_url,
+        help=f"Redis URL (default: {default_url})",
+    )
+    p_es.add_argument(
+        "--out",
+        help="write to this path (default: stream to stdout)",
+    )
+    p_es.add_argument(
+        "--since", type=float, default=0.0,
+        help="wall-clock cutoff (seconds since epoch); only export "
+             "responses with collected_at >= this value",
+    )
+    p_es.add_argument(
+        "--no-anonymize", action="store_true",
+        help="emit raw actor addresses instead of stable opaque hashes "
+             "(internal exports only; default anonymizes)",
+    )
+    p_es.set_defaults(func=cmd_export_surveys)
 
     # tap — live event stream
     p_tap = sub.add_parser(
