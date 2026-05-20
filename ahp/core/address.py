@@ -29,6 +29,25 @@ Examples from the spec: ``"s"``, ``"j"``, ``"sj"``, ``"be"``, ``"sjbe"``.
 VALID_ACCEPT_CHARS: frozenset[str] = frozenset(ACCEPT_TIER_ORDER)
 """Accept tier characters: s=string, j=JSON, b=bytes, e=embeddings."""
 
+
+class AcceptTier:
+    """Named constants for the four accept tiers.
+
+    Use ``AcceptTier.STRING`` instead of ``"s"`` at call sites where
+    readability matters. Each constant is the canonical single-char
+    tier code; multi-tier accept strings (e.g. ``"sj"``) still use the
+    raw chars.
+    """
+
+    STRING: str = "s"
+    JSON: str = "j"
+    BYTES: str = "b"
+    EMBEDDINGS: str = "e"
+
+    ALL: str = ACCEPT_TIER_ORDER
+    """The full ``"sjbe"`` string, in canonical tier order."""
+
+
 _ACCEPT_RANK: dict[str, int] = {c: i for i, c in enumerate(ACCEPT_TIER_ORDER)}
 
 
