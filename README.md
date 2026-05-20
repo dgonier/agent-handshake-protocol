@@ -741,6 +741,53 @@ backend implements the deepagents `BackendProtocol` (`StateBackend`
 ships with the library; `LocalShellBackend`, `StoreBackend`,
 `ContextHubBackend` are also available).
 
+## Addressable knowledge graphs — `kind="kg"` resources
+
+Knowledge-graph backends live alongside filesystems in the resource
+address space, at `{scope}.kg.{domain}.{subdomain}.{name}`. The
+shape (`KGNode`, `KGEdge`, `KnowledgeGraphBackend`), an in-memory
+reference implementation, and a Neo4j-backed adapter (vector index
+included) live in `ahp.adapters.knowledge_graph` and
+`ahp.adapters.neo4j_kg`. Wire one in the same way as any other
+resource:
+
+```python
+from ahp.adapters import resource
+from ahp.adapters.neo4j_kg import Neo4jKnowledgeGraph
+
+@resource("acme", "kg", "finance", "equities", name="primary",
+          cleanup=lambda g: g.close())
+def make_primary_kg():
+    return Neo4jKnowledgeGraph(vector_dimensions=1536,
+                               auto_create_vector_index=True)
+```
+
+`build_kg_backend(resources, agent_address)` resolves the right
+backend for an agent the same way `build_fs_backend` does — single
+match wins, multiple matches raise. See
+`examples/knowledge_graph/` for docker-compose + Terraform
+boilerplate (the vector-index Cypher is the piece that's easy to
+get wrong).
+
+## TeacherAgent — agent-as-judge into the KG
+
+`TeacherAgent` is the writer-side companion to the KG: an
+`AHPAgent` that scores other agents against a `Rubric` and persists
+the resulting `Judgement` into a KG backend. Three inbound codes:
+
+* `teacher.judge` — score one body, write a `Judgement` node linked
+  to subject + rubric, return the verdict.
+* `teacher.survey` — broadcast a prompt, judge each reply, persist
+  per-respondent judgements.
+* `teacher.observe` — write a free-form `Observation` linked to the
+  reporting agent.
+
+`judge_fn` is any callable (sync or async) returning a `Judgement`
+or a `{criterion_name: score}` map — drop in a LangChain chain, a
+deterministic scorer, or a HEXIS-side judge. See
+`examples/knowledge_graph/teacher_demo.py` for an end-to-end run
+against a real Neo4j.
+
 ## MCP passthrough
 
 Register an entire MCP server's tool surface under one scope:
