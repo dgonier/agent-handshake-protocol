@@ -43,7 +43,10 @@ from ahp.llm.openrouter import (
 from ahp.llm.recipe import (
     LoRAHandle,
     ModelHandle,
+    RecipeError,
     all_recipe_handles,
+    compose_recipe,
+    describe_recipe,
     find_loras,
     find_model,
     recipe_summary,
@@ -64,7 +67,10 @@ __all__ = [
     # Recipe primitives
     "LoRAHandle",
     "ModelHandle",
+    "RecipeError",
     "all_recipe_handles",
+    "compose_recipe",
+    "describe_recipe",
     "find_loras",
     "find_model",
     "recipe_summary",
