@@ -59,10 +59,14 @@ weights) use :func:`find_model`, :func:`find_loras`, and
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 
 from ahp.adapters.capability import AgentProfile
+
+
+log = logging.getLogger("ahp.llm.recipe")
 
 
 @dataclass(frozen=True)
@@ -169,3 +173,161 @@ def all_recipe_handles(profile: AgentProfile) -> list:
         out.append(base)
     out.extend(find_loras(profile))
     return out
+
+
+# ── inference composition ────────────────────────────────────────────
+
+
+class RecipeError(RuntimeError):
+    """Raised when a profile's recipe can't be composed into a working
+    chat model — usually because the :class:`ModelHandle` doesn't carry
+    enough endpoint metadata.
+    """
+
+
+def _resolve_endpoint(handle: "ModelHandle") -> str | None:
+    """Pull an endpoint URL out of a :class:`ModelHandle`'s extra map.
+
+    Two supported keys, checked in order:
+
+    * ``"endpoint"`` — literal URL string (e.g. a Modal vLLM deployment).
+    * ``"endpoint_env"`` — name of an env var that holds the URL.
+      Useful for keeping production endpoints out of code while still
+      letting the address layer carry the metadata.
+
+    Returns the URL or ``None`` when neither is set / env var is unset.
+    """
+    import os
+    extra = dict(handle.extra) if handle.extra else {}
+    endpoint = extra.get("endpoint")
+    if endpoint:
+        return str(endpoint)
+    env_name = extra.get("endpoint_env")
+    if env_name:
+        val = os.environ.get(str(env_name))
+        if val:
+            return val
+    return None
+
+
+def compose_recipe(
+    profile: AgentProfile,
+    *,
+    temperature: float = 0.2,
+    max_tokens: int = 1024,
+    api_key_env: str = "OPENROUTER_API_KEY",
+    _chat_model_factory: Any = None,
+) -> Any | None:
+    """Build a ready-to-use chat model from an agent's recipe handles.
+
+    The contract: given an :class:`AgentProfile` whose resources
+    include a :class:`ModelHandle` (and optionally one or more
+    :class:`LoRAHandle`-s), return a LangChain-compatible chat model
+    that :class:`ReactAgent.from_profile` and
+    :class:`DeepAgent.from_profile` can consume directly.
+
+    Resolution rules:
+
+    1. Find the base model via :func:`find_model`. ``None`` → return
+       ``None`` (no recipe at this address; caller falls back to a
+       hand-picked chat model).
+    2. Resolve an endpoint URL via :func:`_resolve_endpoint` — looks
+       for ``endpoint`` or ``endpoint_env`` in the handle's
+       ``extra`` map. No endpoint → :class:`RecipeError`.
+    3. Find any :class:`LoRAHandle`-s via :func:`find_loras`. When at
+       least one is present, the *highest-weighted* LoRA's ``name``
+       becomes the model identifier in the chat request. vLLM (and
+       compatible servers) serve multiple LoRAs on one endpoint and
+       route by the ``model`` request parameter. When no LoRA is
+       present, the base model's ``name`` is used.
+
+    Returns the constructed chat model, or ``None`` when no recipe
+    is present. Raises :class:`RecipeError` when a recipe is partially
+    declared but can't be composed (e.g. handle has no endpoint).
+
+    ``_chat_model_factory`` is a test hook — when set, this function
+    calls it instead of :func:`ahp.llm.openrouter.openrouter_chat_model`.
+    Don't set it in production code; the default routes through the
+    same helper everything else uses.
+    """
+    base = find_model(profile)
+    if base is None:
+        return None
+
+    endpoint = _resolve_endpoint(base)
+    if endpoint is None:
+        raise RecipeError(
+            f"ModelHandle {base.name!r} has no endpoint configured; "
+            "set extra={'endpoint': '<url>'} or "
+            "extra={'endpoint_env': '<ENV_VAR_NAME>'} on the handle"
+        )
+
+    loras = find_loras(profile)
+    if loras:
+        # Pick the highest-weighted LoRA as the served adapter. The
+        # rest are reported in a log line — the typical vLLM deployment
+        # serves them all from the same endpoint, but only one applies
+        # per request via the model= parameter.
+        primary = max(loras, key=lambda h: h.weight)
+        if len(loras) > 1:
+            other_names = sorted(
+                h.name for h in loras if h.name != primary.name
+            )
+            log.info(
+                "compose_recipe: %d LoRAs in profile; routing to %r "
+                "(primary by weight). Others available on the same "
+                "endpoint: %s",
+                len(loras), primary.name, ", ".join(other_names),
+            )
+        model_id = primary.name
+    else:
+        model_id = base.name
+
+    factory = _chat_model_factory
+    if factory is None:
+        from ahp.llm.openrouter import openrouter_chat_model
+        factory = openrouter_chat_model
+
+    return factory(
+        model=model_id,
+        base_url=endpoint,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+
+def describe_recipe(profile: AgentProfile) -> dict[str, Any]:
+    """Return a JSON-friendly dict describing the composed recipe.
+
+    Useful for audit / CLI / runner snapshots — same data
+    :func:`compose_recipe` reads, but without constructing the chat
+    model. The CLI's ``describe-agent`` could surface this someday.
+    """
+    base = find_model(profile)
+    loras = find_loras(profile)
+    if base is None and not loras:
+        return {"base": None, "loras": [], "endpoint": None}
+    endpoint = _resolve_endpoint(base) if base is not None else None
+    primary_lora_name = (
+        max(loras, key=lambda h: h.weight).name if loras else None
+    )
+    return {
+        "base": (
+            {
+                "name": base.name,
+                "repo_id": base.repo_id,
+                "revision": base.revision,
+            }
+            if base is not None else None
+        ),
+        "loras": [
+            {"name": h.name, "weight": h.weight, "repo_id": h.repo_id}
+            for h in loras
+        ],
+        "endpoint": endpoint,
+        "primary_lora": primary_lora_name,
+        "model_id_for_request": (
+            primary_lora_name if primary_lora_name
+            else (base.name if base is not None else None)
+        ),
+    }

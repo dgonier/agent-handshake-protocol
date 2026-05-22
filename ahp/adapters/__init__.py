@@ -20,6 +20,12 @@ imported only on demand so the optional deps stay opt-in:
 """
 
 from ahp.adapters.base import AHPAgent
+from ahp.adapters.gateway import (
+    EmbeddingToTextGateway,
+    GatewayAgent,
+    JsonToTextGateway,
+    RelayingGatewayAgent,
+)
 from ahp.adapters.capability import (
     AgentKind,
     AgentProfile,
@@ -126,23 +132,27 @@ __all__ = [
     "DEFAULT_GROUP_REGISTRY",
     "DEFAULT_RESOURCE_REGISTRY",
     "DEFAULT_TOOL_REGISTRY",
+    "EmbeddingToTextGateway",
     "FS_KIND",
     "FieldNamer",
+    "GatewayAgent",
     "Group",
     "GroupRegistry",
     "HumanAgent",
     "InMemoryKnowledgeGraph",
+    "JsonToTextGateway",
     "JudgeFn",
     "Judgement",
-    "KG_KIND",
     "KGEdge",
     "KGNode",
     "KGSimilarityHit",
+    "KG_KIND",
     "KnowledgeGraphBackend",
     "ObservationLevel",
     "ProvisioningField",
     "ProvisioningPattern",
     "RagSource",
+    "RelayingGatewayAgent",
     "ResolutionConflictError",
     "ResourceAddress",
     "ResourceBinding",
