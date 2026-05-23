@@ -9,6 +9,7 @@ Subcommands:
 * ``list-tools``       — registered tools (optionally filtered by agent address / tags)
 * ``list-resources``   — registered resources
 * ``list-groups``      — named address-pattern groups
+* ``list-skills``      — registered skill playbooks (workflow + suggested addresses)
 * ``profile``          — what tools / resources / prompt an agent address resolves to
 * ``template``         — print a starter tool / resource module to stdout
 * ``scaffold``         — write a starter tool / resource module to a file
@@ -43,6 +44,7 @@ from typing import Sequence, TextIO
 from ahp.adapters import (
     DEFAULT_GROUP_REGISTRY,
     DEFAULT_RESOURCE_REGISTRY,
+    DEFAULT_SKILL_REGISTRY,
     DEFAULT_TOOL_REGISTRY,
 )
 from ahp.adapters.factory import AgentFactory
@@ -129,6 +131,61 @@ def cmd_list_resources(args: argparse.Namespace, out: TextIO) -> int:
         for b in bindings
     ]
     _render_table(out, ["address", "kind", "description"], rows)
+    return 0
+
+
+# ── list-skills ───────────────────────────────────────────────────────
+
+
+def cmd_list_skills(args: argparse.Namespace, out: TextIO) -> int:
+    """List skills registered to :data:`DEFAULT_SKILL_REGISTRY`.
+
+    Each row shows the skill's resource-address, name, tag set, and
+    how many addresses are in each of the four suggested_* bundles
+    (tools / specialists / loras / info-sources). Filterable by
+    --for ADDR (only skills visible to that agent) and --tag.
+    """
+    if not _load_modules(args.module or []): return 2
+    registry = DEFAULT_SKILL_REGISTRY
+
+    if args.for_addr:
+        addr = AgentAddress.parse(args.for_addr)
+        tags = set(args.tag) if args.tag else None
+        bindings = registry.bindings_for_address(addr, tags=tags)
+    else:
+        bindings = list(registry.bindings())
+        if args.tag:
+            wanted = set(args.tag)
+            bindings = [b for b in bindings if wanted & b.tags]
+
+    if not bindings:
+        print("(no skills registered)", file=out)
+        return 0
+
+    rows: list[tuple[str, ...]] = []
+    for b in bindings:
+        sk = b.skill
+        bundle_sizes = (
+            f"t={len(sk.suggested_tools)} "
+            f"s={len(sk.suggested_specialists)} "
+            f"l={len(sk.suggested_loras)} "
+            f"i={len(sk.suggested_information_sources)}"
+        )
+        graph_marker = "yes" if sk.graph is not None else "-"
+        rows.append((
+            str(b.address),
+            sk.name,
+            ",".join(sorted(b.tags)) or "-",
+            graph_marker,
+            bundle_sizes,
+            (sk.description or "").splitlines()[0][:60],
+        ))
+
+    _render_table(
+        out,
+        ["address", "name", "tags", "graph", "bundles", "description"],
+        rows,
+    )
     return 0
 
 
@@ -1315,6 +1372,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_lg = sub.add_parser("list-groups", help="list named address-pattern groups")
     p_lg.add_argument("-m", "--module", action="append", default=[])
     p_lg.set_defaults(func=cmd_list_groups)
+
+    # list-skills
+    p_lsk = sub.add_parser(
+        "list-skills",
+        help="list registered skill playbooks (workflow + suggested addresses)",
+    )
+    p_lsk.add_argument(
+        "-m", "--module", action="append", default=[],
+        help="dotted module to import (may be repeated)",
+    )
+    p_lsk.add_argument(
+        "--for", dest="for_addr",
+        help="filter to skills visible to this agent address",
+    )
+    p_lsk.add_argument(
+        "--tag", action="append", default=[],
+        help="filter by tag (may be repeated; ANY-of)",
+    )
+    p_lsk.set_defaults(func=cmd_list_skills)
 
     # list-agents (live Redis)
     p_la = sub.add_parser(

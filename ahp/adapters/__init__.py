@@ -104,6 +104,13 @@ from ahp.adapters.resources import (
     ResourceRegistry,
     resource,
 )
+from ahp.adapters.skill_registry import (
+    DEFAULT_SKILL_REGISTRY,
+    SKILL_KIND,
+    SkillBinding,
+    SkillRegistry,
+    skill,
+)
 from ahp.adapters.storage import (
     FS_KIND,
     build_fs_backend,
@@ -136,6 +143,7 @@ __all__ = [
     "Criterion",
     "DEFAULT_GROUP_REGISTRY",
     "DEFAULT_RESOURCE_REGISTRY",
+    "DEFAULT_SKILL_REGISTRY",
     "DEFAULT_TOOL_REGISTRY",
     "EmbeddingToTextGateway",
     "FS_KIND",
@@ -166,7 +174,10 @@ __all__ = [
     "ResourceNameCollisionError",
     "ResourceRegistry",
     "Rubric",
+    "SKILL_KIND",
     "Skill",
+    "SkillBinding",
+    "SkillRegistry",
     "SpawnResult",
     "StaticDocumentSource",
     "TeacherAgent",
@@ -191,5 +202,6 @@ __all__ = [
     "node_id_for_rubric",
     "render",
     "resource",
+    "skill",
     "tool",
 ]

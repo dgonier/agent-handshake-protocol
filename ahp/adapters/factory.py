@@ -106,6 +106,7 @@ class AgentFactory:
         groups: GroupRegistry | None = None,
         scope: ScopePolicy | None = None,
         slm: ChatModel | None = None,
+        skills: "SkillRegistry | None" = None,
         *,
         host_server_id: str | None = None,
         fund_agents: bool = False,
@@ -139,6 +140,8 @@ class AgentFactory:
         self._resources = (
             resources if resources is not None else ResourceRegistry()
         )
+        from ahp.adapters.skill_registry import SkillRegistry as _SR
+        self._skills = skills if skills is not None else _SR()
         self._groups = groups if groups is not None else GroupRegistry()
         self._scope = scope
         # Expose the group registry through the engine so adapters can
@@ -177,6 +180,10 @@ class AgentFactory:
     @property
     def resources(self) -> ResourceRegistry:
         return self._resources
+
+    @property
+    def skills(self) -> "SkillRegistry":
+        return self._skills
 
     @property
     def groups(self) -> GroupRegistry:
@@ -237,6 +244,33 @@ class AgentFactory:
 
         # ── resource-registry contribution (collisions raised inside) ──
         base.resources = self._resources.for_address(addr)
+
+        # ── skill-registry contribution ────────────────────────────────
+        # Skills from the address-keyed SkillRegistry compose with skills
+        # already on the base profile (from inline CapabilityProvider).
+        # Two skills with the same short name addressed to one agent is a
+        # wiring bug — surface as a clear error rather than silently
+        # picking one.
+        skill_bindings = self._skills.bindings_for_address(addr)
+        if skill_bindings:
+            merged_skills = list(base.skills)
+            seen_names: dict[str, str] = {
+                s.name: "inline capability provider" for s in base.skills
+            }
+            for b in skill_bindings:
+                short = b.skill.name
+                if short in seen_names and seen_names[short] != str(b.address):
+                    raise ToolNameCollisionError(
+                        f"two skills claim the short name {short!r} for "
+                        f"agent {addr}: {seen_names[short]} and "
+                        f"{b.address}. Rename one or narrow its "
+                        f"allowed_for so they don't both apply."
+                    )
+                if short not in seen_names:
+                    seen_names[short] = str(b.address)
+                    merged_skills.append(b.skill)
+            base.skills = tuple(merged_skills)
+
         return base
 
     # ── registration ────────────────────────────────────────────────────
