@@ -39,6 +39,17 @@ class Code:
     HUMAN_EXPLAIN = "human.explain"
     HUMAN_HALT = "human.halt"
 
+    # ── teacher ─────────────────────────────────────────────────────────
+    TEACHER_JUDGE = "teacher.judge"
+    TEACHER_SURVEY = "teacher.survey"
+    TEACHER_OBSERVE = "teacher.observe"
+    TEACHER_RUBRIC = "teacher.rubric"
+
+    # ── knowledge graph ─────────────────────────────────────────────────
+    KG_WRITE = "kg.write"
+    KG_READ = "kg.read"
+    KG_QUERY = "kg.query"
+
     # ── error ───────────────────────────────────────────────────────────
     ERROR_MALFORMED = "error.malformed"
     ERROR_UNAUTHORIZED = "error.unauthorized"

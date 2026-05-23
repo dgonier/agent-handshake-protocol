@@ -76,7 +76,13 @@ ahp/
 │   ├── langgraph_agent.py  LangGraphAgent + DeepAgentDAG (legacy DAG)
 │   ├── react_agent.py      ReactAgent (wraps create_react_agent)
 │   ├── deep_agent.py       DeepAgent (wraps deepagents.create_deep_agent)
-│   └── dspy_agent.py       DSPyAgent
+│   ├── dspy_agent.py       DSPyAgent
+│   ├── knowledge_graph.py  KGNode/KGEdge + InMemoryKnowledgeGraph +
+│                           build_kg_backend (kind="kg" resources)
+│   ├── neo4j_kg.py         Neo4j-backed KnowledgeGraphBackend with
+│                           native vector index (opt-in [kg] extra)
+│   └── teacher_agent.py    TeacherAgent — agent-as-judge that writes
+│                           Judgement nodes into a KG backend
 ├── llm/
 │   ├── bedrock.py          ChatBedrockConverse helper + creds check
 │   ├── openrouter.py       ChatOpenAI helper for OpenRouter / Modal endpoints
@@ -89,7 +95,12 @@ ahp/
 
 examples/
 ├── fastapi_serve/          generic FastAPI face over the protocol
-└── federation/             two FastAPI processes, one Redis
+├── federation/             two FastAPI processes, one Redis
+└── knowledge_graph/        Neo4j boilerplate + teacher demo
+    ├── docker-compose.neo4j.yml   local Neo4j 5 with APOC + GDS
+    ├── bootstrap_vectors.cypher   idempotent vector-index setup
+    ├── teacher_demo.py            end-to-end TeacherAgent run
+    └── terraform/                 single-node EC2 deployment
 
 tests/                      pytest suite (412 passing)
 ```

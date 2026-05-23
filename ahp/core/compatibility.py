@@ -44,6 +44,20 @@ class CompatibilityMatrix:
         Code.HUMAN_EXPLAIN:          {"s"},
         Code.HUMAN_HALT:             {"s"},
 
+        # ── teacher ───────────────────────────────────────────────────
+        # Survey / judge / observe payloads are JSON-shaped; the rubric
+        # itself is a string the model reads. Both tiers are accepted.
+        Code.TEACHER_JUDGE:          {"s", "j"},
+        Code.TEACHER_SURVEY:         {"s", "j"},
+        Code.TEACHER_OBSERVE:        {"s", "j"},
+        Code.TEACHER_RUBRIC:         {"s", "j"},
+
+        # ── knowledge graph ───────────────────────────────────────────
+        # Reads/writes are JSON CRUD; embeddings travel as bytes/floats.
+        Code.KG_WRITE:               {"j"},
+        Code.KG_READ:                {"j"},
+        Code.KG_QUERY:               {"j", "e"},
+
         # ── error ─────────────────────────────────────────────────────
         # Errors must always be deliverable, so they only require strings.
         Code.ERROR_MALFORMED:        {"s"},

@@ -1,0 +1,58 @@
+# Local Neo4j 5 for the AHP knowledge graph adapter.
+#
+# Brings up a single-node Neo4j 5 with APOC + GDS plugins on the
+# default ports (7474 HTTP / 7687 Bolt). Memory tuned for laptop use —
+# bump heap/pagecache for serious work. Vector index is created by
+# ``bootstrap_vectors.cypher`` (run separately after the container is
+# healthy).
+#
+# Run::
+#
+#     docker compose -f docker-compose.neo4j.yml up -d
+#     docker exec -i ahp-neo4j cypher-shell -u neo4j -p ahp-local-dev \
+#         < bootstrap_vectors.cypher
+#
+# Then in Python::
+#
+#     export NEO4J_URI=bolt://localhost:7687
+#     export NEO4J_USERNAME=neo4j
+#     export NEO4J_PASSWORD=ahp-local-dev
+
+services:
+  neo4j:
+    image: neo4j:5.20
+    container_name: ahp-neo4j
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:7474:7474"  # HTTP / browser
+      - "127.0.0.1:7687:7687"  # Bolt
+    environment:
+      NEO4J_AUTH: "neo4j/ahp-local-dev"
+      # Plugins: APOC (general utility) + GDS (graph data science).
+      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+      # Allow APOC procedures + dynamic labels via apoc.create.addLabels.
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.*,gds.*,db.*"
+      # Tuning — fine for a laptop, scale up for real workloads.
+      NEO4J_server_memory_heap_initial__size: "1G"
+      NEO4J_server_memory_heap_max__size: "2G"
+      NEO4J_server_memory_pagecache_size: "1G"
+      # Listen on all interfaces inside the container so the host port
+      # mapping works.
+      NEO4J_server_default__listen__address: "0.0.0.0"
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - neo4j_import:/var/lib/neo4j/import
+      - neo4j_plugins:/plugins
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p ahp-local-dev 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12  # Neo4j with plugins can take ~90s to come up cold.
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  neo4j_import:
+  neo4j_plugins:
