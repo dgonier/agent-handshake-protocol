@@ -58,6 +58,17 @@ class CompatibilityMatrix:
         Code.KG_READ:                {"j"},
         Code.KG_QUERY:               {"j", "e"},
 
+        # ── information sources ───────────────────────────────────────
+        # Higher-level abstraction over any backend. Tier requirements
+        # are deliberately permissive on the text side ({"s", "j"})
+        # because most info sources can serve either format; the
+        # embedding variant requires bytes/embeddings so it routes only
+        # to sources that can emit raw vectors.
+        Code.INFO_QUERY:             {"s", "j"},
+        Code.INFO_QUERY_EMBEDDING:   {"b", "e"},
+        Code.INFO_LIST:              {"j"},
+        Code.INFO_WRITE:             {"j"},
+
         # ── error ─────────────────────────────────────────────────────
         # Errors must always be deliverable, so they only require strings.
         Code.ERROR_MALFORMED:        {"s"},
