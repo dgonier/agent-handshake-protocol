@@ -50,6 +50,11 @@ from ahp.adapters.groups import (
     group,
 )
 from ahp.adapters.human import HumanAgent, ObservationLevel
+from ahp.adapters.info_source import (
+    InfoSourceAgent,
+    KGBackedSource,
+    StaticDocumentSource,
+)
 from ahp.adapters.knowledge_graph import (
     KG_KIND,
     InMemoryKnowledgeGraph,
@@ -140,9 +145,11 @@ __all__ = [
     "GroupRegistry",
     "HumanAgent",
     "InMemoryKnowledgeGraph",
+    "InfoSourceAgent",
     "JsonToTextGateway",
     "JudgeFn",
     "Judgement",
+    "KGBackedSource",
     "KGEdge",
     "KGNode",
     "KGSimilarityHit",
@@ -161,6 +168,7 @@ __all__ = [
     "Rubric",
     "Skill",
     "SpawnResult",
+    "StaticDocumentSource",
     "TeacherAgent",
     "Tool",
     "ToolAddress",

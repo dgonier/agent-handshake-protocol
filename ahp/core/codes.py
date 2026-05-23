@@ -50,6 +50,26 @@ class Code:
     KG_READ = "kg.read"
     KG_QUERY = "kg.query"
 
+    # ── information sources ─────────────────────────────────────────────
+    # Higher-level abstraction over any backend (KG, document store,
+    # SQL, vector store). An info source is an addressable agent that
+    # declares accept tiers; querying it is a normal SEND-GET with
+    # one of these codes. The tier requirements drive Compatibility-
+    # Matrix negotiation — a caller with accept='s' can hit info.query
+    # but not info.query.embedding, and would route through a gateway
+    # agent if it needs embedding-tier data.
+    INFO_QUERY = "info.query"
+    """Text-style query → text/JSON snippets back."""
+
+    INFO_QUERY_EMBEDDING = "info.query.embedding"
+    """Vector-style query → raw embedding-tier hits back."""
+
+    INFO_LIST = "info.list"
+    """List/enumerate available items in the source. JSON response."""
+
+    INFO_WRITE = "info.write"
+    """Write a document/node into the source. JSON response with id."""
+
     # ── error ───────────────────────────────────────────────────────────
     ERROR_MALFORMED = "error.malformed"
     ERROR_UNAUTHORIZED = "error.unauthorized"
