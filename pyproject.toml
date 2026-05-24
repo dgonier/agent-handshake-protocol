@@ -4,16 +4,30 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ahp"
-version = "0.33.0"
+version = "0.34.0"
 description = "Agentic Handshake Protocol — addressable, format-aware messaging between heterogeneous agents."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "AHP Contributors" }]
-dependencies = []
+dependencies = [
+    # LangGraph + LangChain became base deps in Phase 34 (the format
+    # taxonomy). The Format dataclass carries optional LangGraph
+    # graph builders, and FormatAgent uses LangGraph's Checkpointer
+    # protocol for per-(thread, format) state. The protocol layer
+    # itself doesn't import LangGraph (ahp.core stays zero-dep), but
+    # the adapters layer does. Pinning here so consumers don't have
+    # to remember the [langgraph] extra.
+    "langgraph>=1.0",
+    "langchain>=1.0",
+    "langgraph-checkpoint-redis>=0.4",
+]
 
 [project.optional-dependencies]
 redis = ["redis>=5.0"]
+# Kept for backwards compat with any documentation pointing at
+# ``ahp[langgraph]``; the deps are now in base, so installing this
+# extra is a no-op.
 langgraph = ["langgraph>=1.0", "langchain>=1.0"]
 dspy = ["dspy-ai>=2.4"]
 aws = ["langchain-aws>=0.2", "boto3>=1.34", "python-dotenv>=1.0"]
@@ -30,6 +44,7 @@ test = [
     "fakeredis>=2.20",
     "redis>=5.0",
     "langgraph>=1.0",
+    "langgraph-checkpoint-redis>=0.4",
     "dspy-ai>=2.4",
     "langchain-aws>=0.2",
     "langchain-openai>=0.2",

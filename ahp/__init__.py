@@ -16,4 +16,4 @@ __all__ = [
     "CompatibilityMatrix",
 ]
 
-__version__ = "0.33.0"
+__version__ = "0.34.0"

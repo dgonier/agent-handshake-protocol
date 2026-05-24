@@ -80,9 +80,11 @@ from ahp.adapters.formats import (
     FORMATS,
     Format,
     FormatNotFoundError,
+    TerminationRule,
     get_format,
     list_formats,
 )
+from ahp.adapters.format_agent import FormatAgent
 from ahp.adapters.inviter import AgentInvitation, ChatModel, Inviter
 from ahp.adapters.prompts import (
     RECIPES,
@@ -148,6 +150,7 @@ __all__ = [
     "EmbeddingToTextGateway",
     "FS_KIND",
     "FieldNamer",
+    "FormatAgent",
     "GatewayAgent",
     "Group",
     "GroupRegistry",
@@ -181,6 +184,7 @@ __all__ = [
     "SpawnResult",
     "StaticDocumentSource",
     "TeacherAgent",
+    "TerminationRule",
     "Tool",
     "ToolAddress",
     "ToolBinding",

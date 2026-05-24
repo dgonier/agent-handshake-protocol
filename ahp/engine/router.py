@@ -38,6 +38,7 @@ from ahp.core.compatibility import CompatibilityMatrix
 from ahp.core.message import Message
 from ahp.core.pattern import AddressPattern
 from ahp.engine.errors import (
+    FormatViolationError,
     IncompatibleTargetError,
     InvalidTargetTypeError,
     ProtocolError,
@@ -123,6 +124,12 @@ class ProtocolEngine:
             kwargs["timeout"] = timeout
         if message.verb == "CAST-GET":
             kwargs["max_responses"] = max_responses
+
+        # Format enforcement: only fires when the caller declared a
+        # format. Backwards-compatible — every existing call site omits
+        # message.format and skips this check entirely.
+        if message.format is not None:
+            self._check_format(message)
 
         try:
             result = await dispatch(message, **kwargs)
@@ -600,6 +607,65 @@ class ProtocolEngine:
             raise IncompatibleTargetError(
                 f"target {target} accept={target.accept!r} cannot receive "
                 f"code {code!r} (required: any of {sorted(tiers)})"
+            )
+
+    def _check_format(self, message: Message) -> None:
+        """Validate a format-tagged message against its format spec.
+
+        Three checks, in order:
+
+        1. The declared format name must exist in
+           :data:`~ahp.adapters.FORMATS`.
+        2. For turn_sequence formats: the message's code must be in
+           the format's ``turn_primitives`` vocabulary.
+        3. The sender's address role must be permitted to send this
+           turn under ``role_turn_permissions`` (only checked when
+           the format declares any role gating).
+
+        Raises :class:`FormatViolationError` on any failure. Failures
+        happen before the bus is touched — no message goes out if the
+        format envelope is wrong.
+
+        legacy_session formats only get check 1: they don't declare a
+        turn vocabulary or role gate, so checks 2 and 3 are skipped.
+        """
+        # Lazy import — keeps ahp.engine independent of ahp.adapters at
+        # module load time. The adapters package imports the engine
+        # already; pulling the engine to import adapters would create
+        # the cycle.
+        from ahp.adapters.formats import FORMATS
+
+        fmt_name = message.format
+        fmt = FORMATS.get(fmt_name)
+        if fmt is None:
+            raise FormatViolationError(
+                f"message declared format {fmt_name!r} but no such "
+                f"format is registered (known: "
+                f"{sorted(FORMATS.keys())[:8]}…)"
+            )
+
+        if fmt.recipe_kind == "legacy_session":
+            # Legacy formats don't declare per-turn constraints.
+            return
+
+        if not fmt.is_turn_in_format(message.code):
+            raise FormatViolationError(
+                f"code {message.code!r} is not a turn primitive of "
+                f"format {fmt_name!r} (allowed: "
+                f"{sorted(fmt.turn_primitives)})"
+            )
+
+        # Only enforce the role gate when the format declares one.
+        if fmt.role_turn_permissions and not fmt.is_turn_legal(
+            message.source.role, message.code,
+        ):
+            permitted = fmt.role_turn_permissions.get(
+                message.source.role, frozenset(),
+            )
+            raise FormatViolationError(
+                f"source role {message.source.role!r} is not permitted "
+                f"to send turn {message.code!r} in format {fmt_name!r}"
+                f" (this role's permitted turns: {sorted(permitted)})"
             )
 
     def _check_scope(
