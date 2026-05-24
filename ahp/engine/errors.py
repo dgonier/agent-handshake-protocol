@@ -26,3 +26,19 @@ class UnauthorizedError(ProtocolError):
     (CAST, CAST-GET) the engine silently drops disallowed targets
     from the resolved set — same pattern compatibility uses.
     """
+
+
+class FormatViolationError(ProtocolError):
+    """A message declared a format but violates one of its invariants.
+
+    Raised at dispatch time before the bus is touched. Three cases:
+
+    * The declared format doesn't exist in :data:`~ahp.adapters.FORMATS`.
+    * The message's code isn't in the format's ``turn_primitives``
+      vocabulary (only checked for ``recipe_kind="turn_sequence"``).
+    * The sender's address role isn't permitted to send this turn
+      under the format's ``role_turn_permissions`` map.
+
+    Callers using ``Message(..., format=None)`` (the default) never
+    hit this — format enforcement is fully opt-in.
+    """

@@ -93,6 +93,15 @@ class Message:
     ttl: int | None = None
     reply_to: str | None = None
     message_id: str = field(default_factory=_new_id)
+    format: str | None = None
+    """Name of the :class:`~ahp.adapters.Format` this message is part
+    of. When set, the engine enforces format invariants at dispatch
+    time: the code (interpreted as a turn primitive) must be in the
+    format's turn vocabulary, and the source's role must be permitted
+    to send that turn. ``None`` (the default) opts out of format
+    enforcement — the message dispatches under normal compatibility
+    checks only. Backwards-compatible: every existing call site
+    omits this field."""
 
     def __post_init__(self) -> None:
         if not isinstance(self.source, AgentAddress):
@@ -183,6 +192,7 @@ class Message:
             "timestamp": self.timestamp.isoformat(),
             "ttl": self.ttl,
             "reply_to": self.reply_to,
+            "format": self.format,
         }
 
     @classmethod
@@ -221,4 +231,5 @@ class Message:
             ttl=data.get("ttl"),
             reply_to=data.get("reply_to"),
             message_id=data.get("message_id", _new_id()),
+            format=data.get("format"),
         )
