@@ -427,6 +427,23 @@ FORMATS: dict[str, Format] = {
 }
 
 
+# ── register the 24 turn-sequence game modes ────────────────────────
+# The taxonomy doc's 24 formats live in ahp/adapters/game_modes.py.
+# We import the canonical tuple and fold it into FORMATS so all
+# discovery (`ahp list-formats`, get_format(...), the engine's
+# _check_format) sees both legacy session formats and the new
+# turn-sequence formats through one registry.
+from ahp.adapters.game_modes import GAME_MODE_FORMATS as _GAME_MODE_FORMATS
+
+for _fmt in _GAME_MODE_FORMATS:
+    if _fmt.name in FORMATS:
+        raise RuntimeError(
+            f"format name collision at import time: {_fmt.name!r} "
+            f"appears in both legacy FORMATS and the game_modes module"
+        )
+    FORMATS[_fmt.name] = _fmt
+
+
 class FormatNotFoundError(LookupError):
     """No format registered with the given name."""
 
