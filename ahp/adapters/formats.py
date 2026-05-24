@@ -1,58 +1,230 @@
 """Session formats — bind a protocol code, role, recipe slate, and turn
 pattern into a single named interaction shape.
 
-A *format* describes one end-to-end run:
+Two flavors share the :class:`Format` dataclass via the
+``recipe_kind`` discriminator:
+
+1. ``recipe_kind="legacy_session"`` (default; backwards compat) — the
+   original session-shaped format. Fields ``code``, ``role``,
+   ``round1_recipe``, plus the round-kind metadata, drive the
+   moderator-led multi-round runner in ``examples/viewer/runner.py``.
+
+2. ``recipe_kind="turn_sequence"`` (the format taxonomy) — describes
+   a dyadic or n-adic conversation in terms of:
+   * ``turn_primitives`` — the set of ``turn.*`` :class:`Code`-s that
+     are legal moves in this format.
+   * ``role_set`` — the conversational roles participants take
+     (``"questioner"``, ``"responder"``, ``"rhetor"``, ``"audience"``,
+     ``"mediator"``, etc).
+   * ``role_turn_permissions`` — ``{role -> {allowed_turn_primitive}}``
+     map. Engine-level enforcement rejects messages whose role isn't
+     permitted to send that turn.
+   * ``termination_rule`` — when the conversation ends (counter,
+     signal, never).
+   * ``invariants_prompt`` — text describing the format's soft
+     invariants (anti-synthesis pressure for Agonistic, "no
+     rebuttal until reflection accepted" for Rogerian). The agent
+     loads this into the LLM's system prompt; not engine-enforced.
+   * ``graph_builder`` — a callable returning a compiled LangGraph
+     DAG implementing the format's rhythm. ``None`` if the format
+     ships only as a spec (allowed but uncommon).
+
+Legacy session fields:
 
 * ``code`` — protocol :class:`Code` for every round.
 * ``role`` — the address ``role`` the SLM materializes agents at.
 * ``round1_recipe`` — recipe key for the opening round
   (``"<role>:<mode>"``).
-* ``round2_recipe`` — recipe key for the middle round, or ``None`` to
-  skip.
-* ``closing_recipe`` — recipe key for the closing round, or ``None`` to
-  skip. Every format that ships defines one.
-* ``count_strategy`` — ``"as_requested"`` or ``"force_one"`` (used by
-  one-on-one formats like ``interview-me``, ``teach``, ``interrogate``).
-* ``round2_kind`` — how round 2 is dispatched:
-    * ``"broadcast"`` — moderator broadcasts to every agent.
-    * ``"sequential_probes"`` — N moderator probes to the single agent.
-    * ``"skip"`` — no round 2.
-* ``closing_kind`` — same vocabulary, applied to the closing round.
+* ``round2_recipe`` — recipe key for the middle round, or ``None``.
+* ``closing_recipe`` — recipe key for the closing round, or ``None``.
+* ``count_strategy`` — ``"as_requested"`` or ``"force_one"``.
+* ``round2_kind`` / ``closing_kind`` — ``"broadcast"`` /
+  ``"sequential_probes"`` / ``"skip"``.
 * ``probe_count`` — turns when ``*_kind == "sequential_probes"``.
-* ``mode_hint`` — plain-English nudge passed to the :class:`Inviter` so
-  the SLM picks *kind*-appropriate perspectives.
+* ``mode_hint`` — plain-English nudge for the :class:`Inviter`.
 
 Adding a format is one entry in :data:`FORMATS` — no runner changes.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, field
+from typing import Any, Callable, Literal
 
 from ahp.core.codes import Code
 
 
 CountStrategy = Literal["as_requested", "force_one"]
 RoundKind = Literal["broadcast", "sequential_probes", "skip"]
+RecipeKind = Literal["legacy_session", "turn_sequence"]
+TerminationKind = Literal["counter", "signal", "never", "convergence"]
+
+
+@dataclass(frozen=True)
+class TerminationRule:
+    """How a turn-sequence format ends.
+
+    * ``"counter"`` — terminate after ``max_turns`` turns.
+    * ``"signal"`` — terminate when a specific turn primitive fires
+      (e.g. ``Code.TURN_COMMIT`` for Negotiation, ``Code.TURN_DECIDE``
+      for Deliberative).
+    * ``"convergence"`` — terminate when a per-format measurement
+      flatlines (e.g. Dialectical synthesis stops adding info). The
+      format author plugs in the measurement via the graph; this
+      field documents the intent.
+    * ``"never"`` — does not formally terminate. Used by Polyphonic,
+      Levinasian, Agonistic. Callers extract state at any point.
+    """
+
+    kind: TerminationKind = "counter"
+    max_turns: int = 16
+    """Used when kind=='counter'. Hard cap regardless of other rules."""
+
+    signal_codes: tuple[str, ...] = ()
+    """Used when kind=='signal'. Any of these turn codes terminates."""
+
+    description: str = ""
+    """Human-readable summary for docs / list-formats output."""
 
 
 @dataclass(frozen=True)
 class Format:
-    """One named interaction shape."""
+    """One named interaction shape — either a legacy session
+    template or a turn-sequence game mode (see module docstring)."""
 
     name: str
     description: str
-    code: str
-    role: str
-    round1_recipe: str
-    round2_recipe: str | None
-    closing_recipe: str | None
+
+    # ── legacy session fields (recipe_kind="legacy_session") ─────────
+    # All default to None / "*" so a turn_sequence format can omit
+    # them. __post_init__ validates required combos.
+    code: str | None = None
+    role: str = "*"
+    round1_recipe: str | None = None
+    round2_recipe: str | None = None
+    closing_recipe: str | None = None
     count_strategy: CountStrategy = "as_requested"
     round2_kind: RoundKind = "broadcast"
     closing_kind: RoundKind = "broadcast"
     probe_count: int = 3
     mode_hint: str = ""
+
+    # ── turn-sequence fields (recipe_kind="turn_sequence") ────────────
+    recipe_kind: RecipeKind = "legacy_session"
+
+    turn_primitives: tuple[str, ...] = ()
+    """The ``turn.*`` codes legal in this format. Engine checks
+    ``message.code in turn_primitives`` for turn_sequence formats."""
+
+    role_set: tuple[str, ...] = ()
+    """The conversational roles participants take (e.g. "questioner",
+    "responder"). Set semantics: the union of legal address.role
+    fields participants may carry. Empty tuple means the format
+    doesn't constrain role."""
+
+    role_turn_permissions: dict[str, frozenset[str]] = field(
+        default_factory=dict
+    )
+    """Map ``role -> {allowed turn primitives}``. Engine enforces:
+    sender's address.role must be in this map, and message.code must
+    be in the permitted set for that role. Empty dict means no
+    role-based gating."""
+
+    termination_rule: TerminationRule = field(
+        default_factory=TerminationRule
+    )
+    """How the conversation ends. Default: 16-turn counter."""
+
+    invariants_prompt: str = ""
+    """Soft invariants the LLM should read in its system prompt.
+    Anti-synthesis pressure for Agonistic, "reflection before
+    rebuttal" for Rogerian, etc. Not engine-enforced — the format
+    author is trusting the model to follow the guidance."""
+
+    graph_builder: Callable[..., Any] | None = None
+    """A factory returning a compiled LangGraph DAG implementing the
+    format's rhythm. Called with format-specific kwargs (typically
+    a participants list and a thread id). ``None`` is allowed —
+    means the format ships as a spec only, no executable graph."""
+
+    measurement_hooks: tuple[Callable[..., Any], ...] = ()
+    """Optional callables that score a thread post-hoc for soft
+    invariants (e.g. "did this conversation prematurely synthesize?").
+    Each takes a thread history; returns a float. Scores flow into
+    audit + reputation. Empty tuple = no post-hoc measurement."""
+
+    def __post_init__(self) -> None:
+        # Validate the recipe_kind + required fields combo.
+        if self.recipe_kind == "legacy_session":
+            if self.code is None:
+                raise ValueError(
+                    f"legacy_session format {self.name!r} requires "
+                    f"a code"
+                )
+            if self.round1_recipe is None:
+                raise ValueError(
+                    f"legacy_session format {self.name!r} requires "
+                    f"round1_recipe"
+                )
+        elif self.recipe_kind == "turn_sequence":
+            if not self.turn_primitives:
+                raise ValueError(
+                    f"turn_sequence format {self.name!r} requires "
+                    f"non-empty turn_primitives"
+                )
+            if not self.role_set:
+                raise ValueError(
+                    f"turn_sequence format {self.name!r} requires "
+                    f"non-empty role_set"
+                )
+            # role_turn_permissions keys must be a subset of role_set.
+            for role in self.role_turn_permissions:
+                if role not in self.role_set:
+                    raise ValueError(
+                        f"format {self.name!r} role_turn_permissions "
+                        f"references role {role!r} not in role_set "
+                        f"{self.role_set}"
+                    )
+            # Every permitted turn must be in turn_primitives.
+            for role, turns in self.role_turn_permissions.items():
+                extras = set(turns) - set(self.turn_primitives)
+                if extras:
+                    raise ValueError(
+                        f"format {self.name!r} role_turn_permissions"
+                        f"[{role!r}] permits turns not in "
+                        f"turn_primitives: {sorted(extras)}"
+                    )
+        else:  # pragma: no cover — Literal restricts
+            raise ValueError(
+                f"unknown recipe_kind: {self.recipe_kind!r}"
+            )
+
+    # ── helpers ──────────────────────────────────────────────────────
+
+    def is_turn_legal(self, role: str, turn_code: str) -> bool:
+        """True when an agent with the given role may send a message
+        with this turn primitive. Used by engine-level enforcement.
+
+        When ``role_turn_permissions`` is empty the check passes —
+        callers haven't declared a role gate, so the engine doesn't
+        impose one. When the role is in the map but its permitted
+        set doesn't include the turn, returns False.
+        """
+        if not self.role_turn_permissions:
+            return True
+        permitted = self.role_turn_permissions.get(role)
+        if permitted is None:
+            return False
+        return turn_code in permitted
+
+    def is_turn_in_format(self, turn_code: str) -> bool:
+        """True when ``turn_code`` is among this format's primitives.
+
+        Always True for legacy_session formats (they don't declare a
+        turn vocabulary)."""
+        if self.recipe_kind == "legacy_session":
+            return True
+        return turn_code in self.turn_primitives
 
 
 # ── format registry ────────────────────────────────────────────────────
