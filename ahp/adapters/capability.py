@@ -29,6 +29,7 @@ from typing import Any, Awaitable, Callable, Iterable, Literal, Mapping, Optiona
 
 from ahp.core.address import AgentAddress
 from ahp.core.pattern import AddressPattern
+from ahp.adapters.tool_address import ResourceAddress, ToolAddress
 
 
 AgentKind = Literal["react", "deep", "custom"]
@@ -58,16 +59,63 @@ class Tool:
 
 @dataclass(frozen=True)
 class Skill:
-    """A named bundle of tools + prompt fragment.
+    """An executable workflow playbook with suggested-address bundles.
 
-    Skills group related tools and provide a snippet the system prompt
-    composer can use to describe the capability to the model.
+    A skill is more than a capability tag — it's a description of a
+    *workflow* the agent can run, plus the addresses of the things
+    that workflow expects to coordinate:
+
+    * ``tools`` — concrete callables stitched into the workflow (the
+      original "bundle of tools" use case).
+    * ``prompt_fragment`` — system-prompt snippet describing the
+      skill to the model.
+    * ``when_to_use`` — natural-language guidance on when this skill
+      applies (used by the model to decide whether to invoke it).
+    * ``graph`` — a compiled LangGraph DAG (or any callable graph).
+      ``Any`` rather than a tight type so this module stays
+      framework-agnostic; production skills ship a
+      :class:`langgraph.graph.CompiledStateGraph`. The graph IS the
+      executable workflow; everything else is metadata or
+      suggested-context for the agent that runs it.
+    * ``suggested_tools`` — tool addresses the workflow is built
+      around. Distinct from ``tools``: ``tools`` is the inline
+      callables the skill bundles; ``suggested_tools`` is the broader
+      address space the skill expects to operate over (and other
+      orgs' tools by address too).
+    * ``suggested_specialists`` — agent addresses (or patterns) the
+      workflow may consult — specialists with persistent memory and
+      LoRAs that contribute domain expertise.
+    * ``suggested_loras`` — LoRA resource addresses an agent
+      executing this skill should compose into its model.
+    * ``suggested_information_sources`` — resource/agent addresses of
+      databases, vector stores, document corpora, knowledge bases
+      the workflow reads from or writes to. Same pattern as agent
+      accept tiers — info sources are addressable, tier-declaring,
+      and billable per query.
+
+    The four ``suggested_*`` lists are advisory: a sophisticated
+    agent could ignore them and pick differently, but they document
+    the canonical execution recipe and let the broker pre-check that
+    the addresses are reachable.
     """
 
     name: str
     description: str
     tools: tuple[Tool, ...] = ()
     prompt_fragment: str = ""
+
+    # ── workflow + suggested addresses ──────────────────────────────
+    when_to_use: str = ""
+    graph: Any = None
+    """A compiled workflow graph (typically LangGraph). The skill IS
+    this graph; everything else is metadata describing how to run it."""
+
+    suggested_tools: tuple[ToolAddress, ...] = ()
+    suggested_specialists: tuple[AgentAddress | AddressPattern, ...] = ()
+    suggested_loras: tuple[ResourceAddress, ...] = ()
+    suggested_information_sources: tuple[
+        ResourceAddress | AgentAddress | AddressPattern, ...
+    ] = ()
 
 
 @dataclass(frozen=True)
