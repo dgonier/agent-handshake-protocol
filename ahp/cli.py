@@ -465,6 +465,11 @@ def cmd_new(args: argparse.Namespace, out: TextIO) -> int:
     """
     from ahp import scaffolders
     try:
+        # depth defaults to "starter" in the scaffolders themselves;
+        # propagate the CLI flag (also defaulted to "starter") here so
+        # the argparse layer is the single source of truth for default
+        # advertised in --help.
+        depth = getattr(args, "depth", "starter")
         if args.kind == "tool":
             path = scaffolders.scaffold_tool(
                 name=scaffolders.normalize_name(args.name),
@@ -472,6 +477,7 @@ def cmd_new(args: argparse.Namespace, out: TextIO) -> int:
                 role=args.role, category=args.category,
                 signature=args.signature or "query: str",
                 summary=args.summary,
+                depth=depth,
                 out_dir=Path(args.path) if args.path else None,
                 force=args.force,
             )
@@ -480,6 +486,7 @@ def cmd_new(args: argparse.Namespace, out: TextIO) -> int:
                 name=scaffolders.normalize_name(args.name),
                 kind=args.type,
                 scope=args.scope,
+                depth=depth,
                 out_dir=Path(args.path) if args.path else None,
                 force=args.force,
             )
@@ -488,6 +495,8 @@ def cmd_new(args: argparse.Namespace, out: TextIO) -> int:
                 name=scaffolders.normalize_name(args.name),
                 kind=args.type,
                 scope=args.scope, role=args.role,
+                format=getattr(args, "format", None),
+                depth=depth,
                 out_dir=Path(args.path) if args.path else None,
                 force=args.force,
             )
@@ -1460,6 +1469,11 @@ def build_parser() -> argparse.ArgumentParser:
                                  "e.g. 'query: str, top_k: int = 5'")
     p_new_tool.add_argument("--summary",
                             help="one-line docstring for the generated function")
+    p_new_tool.add_argument("--depth", default="starter",
+                            choices=["skeleton", "starter"],
+                            help="skeleton = NotImplementedError stub; "
+                                 "starter (default) = runnable echo "
+                                 "implementation")
     p_new_tool.add_argument("--path",
                             help="project root override (default: cwd)")
     p_new_tool.add_argument("-f", "--force", action="store_true",
@@ -1478,6 +1492,10 @@ def build_parser() -> argparse.ArgumentParser:
                            help="auth pattern; oauth scaffold is "
                                 "intentionally a stub")
     p_new_int.add_argument("--scope", default="tifin")
+    p_new_int.add_argument("--depth", default="starter",
+                           choices=["skeleton", "starter"],
+                           help="skeleton = NotImplementedError stubs; "
+                                "starter (default) = runnable defaults")
     p_new_int.add_argument("--path",
                            help="project root override (default: cwd)")
     p_new_int.add_argument("-f", "--force", action="store_true",
@@ -1491,11 +1509,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_new_agent.add_argument("--name", required=True,
                              help="agent name (snake_case)")
-    p_new_agent.add_argument("--type", default="simple",
-                             choices=["simple", "react", "deepagent"],
-                             help="framework for the agent body")
+    p_new_agent.add_argument(
+        "--type", default="simple",
+        choices=["simple", "react", "deepagent", "formatagent"],
+        help="framework for the agent body. formatagent requires "
+             "--format <name> and scaffolds one on_<turn> hook per "
+             "turn primitive in the declared format.",
+    )
     p_new_agent.add_argument("--scope", default="tifin")
     p_new_agent.add_argument("--role", default="researcher")
+    p_new_agent.add_argument(
+        "--format",
+        help="format name when --type=formatagent (e.g. "
+             "information-exchange, socratic, co-creative). Required "
+             "for formatagent, ignored for other types.",
+    )
+    p_new_agent.add_argument(
+        "--depth", default="starter",
+        choices=["skeleton", "starter"],
+        help="skeleton = NotImplementedError stubs (must fill before "
+             "running); starter (default) = runnable agent with "
+             "templated responses",
+    )
     p_new_agent.add_argument("--path",
                              help="project root override (default: cwd)")
     p_new_agent.add_argument("-f", "--force", action="store_true",
